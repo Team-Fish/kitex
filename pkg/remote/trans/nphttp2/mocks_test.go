@@ -20,20 +20,21 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net"
 	"reflect"
 	"sync"
 	"time"
 
-	"github.com/cloudwego/kitex/internal/stats"
+	"github.com/cloudwego/netpoll"
+	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/runtime/protoimpl"
+
 	"github.com/cloudwego/kitex/pkg/remote"
 	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/grpc"
 	"github.com/cloudwego/kitex/pkg/rpcinfo"
 	"github.com/cloudwego/kitex/pkg/serviceinfo"
 	"github.com/cloudwego/kitex/pkg/utils"
-	"github.com/cloudwego/netpoll"
-	"google.golang.org/protobuf/reflect/protoreflect"
-	"google.golang.org/protobuf/runtime/protoimpl"
 )
 
 var (
@@ -54,6 +55,7 @@ func newMockNpConn(address string) *mockNetpollConn {
 		mockQueue: []mockFrame{},
 	}
 	mc.mockConn.ReadFunc = mc.mockReader
+	mc.reader = &mockNetpollReader{reader: mc.mockConn}
 	return mc
 }
 
@@ -119,20 +121,17 @@ var _ netpoll.Connection = &mockNetpollConn{}
 // mockNetpollConn implements netpoll.Connection.
 type mockNetpollConn struct {
 	mockConn
-	ReaderFunc   func() (r netpoll.Reader)
-	WriterFunc   func() (r netpoll.Writer)
 	mockQueue    []mockFrame
 	queueCounter int
 	counterLock  sync.Mutex
+	reader       *mockNetpollReader
 }
 
 func (m *mockNetpollConn) Reader() netpoll.Reader {
-	// TODO implement me
-	panic("implement me")
+	return m.reader
 }
 
 func (m *mockNetpollConn) Writer() netpoll.Writer {
-	// TODO implement me
 	panic("implement me")
 }
 
@@ -141,6 +140,10 @@ func (m *mockNetpollConn) IsActive() bool {
 }
 
 func (m *mockNetpollConn) SetReadTimeout(timeout time.Duration) error {
+	return nil
+}
+
+func (m *mockNetpollConn) SetWriteTimeout(timeout time.Duration) error {
 	return nil
 }
 
@@ -160,9 +163,35 @@ func (m *mockNetpollConn) WriteFrame(hdr, data []byte) (n int, err error) {
 	return
 }
 
-func (c *mockNetpollConn) ReadFrame() (hdr, data []byte, err error) {
+func (m *mockNetpollConn) ReadFrame() (hdr, data []byte, err error) {
 	return
 }
+
+var _ netpoll.Reader = &mockNetpollReader{}
+
+// mockNetpollReader implements netpoll.Reader.
+type mockNetpollReader struct {
+	reader io.Reader
+}
+
+func (m *mockNetpollReader) Next(n int) (p []byte, err error) {
+	p = make([]byte, n)
+	_, err = m.reader.Read(p)
+	if err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+func (m *mockNetpollReader) Peek(n int) (buf []byte, err error)        { return }
+func (m *mockNetpollReader) Skip(n int) (err error)                    { return }
+func (m *mockNetpollReader) Until(delim byte) (line []byte, err error) { return }
+func (m *mockNetpollReader) ReadString(n int) (s string, err error)    { return }
+func (m *mockNetpollReader) ReadBinary(n int) (p []byte, err error)    { return }
+func (m *mockNetpollReader) ReadByte() (b byte, err error)             { return }
+func (m *mockNetpollReader) Slice(n int) (r netpoll.Reader, err error) { return }
+func (m *mockNetpollReader) Release() (err error)                      { return }
+func (m *mockNetpollReader) Len() (length int)                         { return }
 
 var _ net.Conn = &mockConn{}
 
@@ -267,7 +296,7 @@ func newMockConnOption() remote.ConnOption {
 
 func newMockServerOption() *remote.ServerOption {
 	return &remote.ServerOption{
-		SvcInfo:               nil,
+		SvcSearcher:           nil,
 		TransServerFactory:    nil,
 		SvrHandlerFactory:     nil,
 		Codec:                 nil,
@@ -278,10 +307,10 @@ func newMockServerOption() *remote.ServerOption {
 		AcceptFailedDelayTime: 0,
 		MaxConnectionIdleTime: 0,
 		ReadWriteTimeout:      0,
-		InitRPCInfoFunc: func(ctx context.Context, addr net.Addr) (rpcinfo.RPCInfo, context.Context) {
-			return newMockRPCInfo(), context.Background()
+		InitOrResetRPCInfoFunc: func(ri rpcinfo.RPCInfo, addr net.Addr) rpcinfo.RPCInfo {
+			return newMockRPCInfo()
 		},
-		TracerCtl: &stats.Controller{},
+		TracerCtl: &rpcinfo.TraceController{},
 		GRPCCfg: &grpc.ServerConfig{
 			MaxStreams:                 0,
 			KeepaliveParams:            grpc.ServerKeepalive{},
@@ -322,6 +351,12 @@ func newMockDialer() *remote.SynthesizedDialer {
 		npConn.mockSettingFrame()
 		return npConn, nil
 	}
+	return d
+}
+
+func newMockDialerWithDialFunc(dialFunc func(network, address string, timeout time.Duration) (net.Conn, error)) *remote.SynthesizedDialer {
+	d := &remote.SynthesizedDialer{}
+	d.DialFunc = dialFunc
 	return d
 }
 
@@ -380,6 +415,7 @@ var _ remote.Message = &mockMessage{}
 type mockMessage struct {
 	RPCInfoFunc         func() rpcinfo.RPCInfo
 	ServiceInfoFunc     func() *serviceinfo.ServiceInfo
+	SetServiceInfoFunc  func(svcName, methodName string) (*serviceinfo.ServiceInfo, error)
 	DataFunc            func() interface{}
 	NewDataFunc         func(method string) (ok bool)
 	MessageTypeFunc     func() remote.MessageType
@@ -408,6 +444,13 @@ func (m *mockMessage) ServiceInfo() (si *serviceinfo.ServiceInfo) {
 		return m.ServiceInfoFunc()
 	}
 	return
+}
+
+func (m *mockMessage) SpecifyServiceInfo(svcName, methodName string) (si *serviceinfo.ServiceInfo, err error) {
+	if m.SetServiceInfoFunc != nil {
+		return m.SetServiceInfoFunc(svcName, methodName)
+	}
+	return nil, nil
 }
 
 func (m *mockMessage) Data() interface{} {

@@ -21,9 +21,13 @@ import (
 	"testing"
 
 	"github.com/bytedance/gopkg/cloud/metainfo"
+
 	"github.com/cloudwego/kitex/internal/mocks"
 	"github.com/cloudwego/kitex/internal/test"
+	"github.com/cloudwego/kitex/pkg/logid"
 	"github.com/cloudwego/kitex/pkg/remote"
+	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/metadata"
+	"github.com/cloudwego/kitex/pkg/remote/transmeta"
 	"github.com/cloudwego/kitex/pkg/rpcinfo"
 	"github.com/cloudwego/kitex/pkg/serviceinfo"
 	"github.com/cloudwego/kitex/transport"
@@ -66,7 +70,9 @@ func TestClientWriteMetainfo(t *testing.T) {
 	test.Assert(t, err == nil)
 
 	kvs := msg.TransInfo().TransStrInfo()
-	test.Assert(t, len(kvs) == 0)
+	test.Assert(t, len(kvs) == 2, kvs)
+	test.Assert(t, kvs[metainfo.PrefixTransient+"tk"] == "tv")
+	test.Assert(t, kvs[metainfo.PrefixPersistent+"pk"] == "pv")
 
 	msg.SetProtocolInfo(remote.NewProtocolInfo(transport.TTHeader, serviceinfo.Thrift))
 	_, err = MetainfoClientHandler.WriteMeta(ctx, msg)
@@ -95,11 +101,12 @@ func TestServerReadMetainfo(t *testing.T) {
 	tvs := metainfo.GetAllValues(ctx)
 	pvs := metainfo.GetAllPersistentValues(ctx)
 	test.Assert(t, err == nil)
-	test.Assert(t, len(tvs) == 0)
-	test.Assert(t, len(pvs) == 0)
+	test.Assert(t, len(tvs) == 1 && tvs["tk"] == "tv", tvs)
+	test.Assert(t, len(pvs) == 1 && pvs["pk"] == "pv")
 
 	msg.SetProtocolInfo(remote.NewProtocolInfo(transport.TTHeader, serviceinfo.Thrift))
 	ctx, err = MetainfoServerHandler.ReadMeta(ctx0, msg)
+	ctx = metainfo.TransferForward(ctx)
 	tvs = metainfo.GetAllValues(ctx)
 	pvs = metainfo.GetAllPersistentValues(ctx)
 	test.Assert(t, err == nil)
@@ -109,7 +116,7 @@ func TestServerReadMetainfo(t *testing.T) {
 	ctx = metainfo.TransferForward(ctx)
 	tvs = metainfo.GetAllValues(ctx)
 	pvs = metainfo.GetAllPersistentValues(ctx)
-	test.Assert(t, len(tvs) == 0)
+	test.Assert(t, len(tvs) == 0, len(tvs))
 	test.Assert(t, len(pvs) == 1 && pvs["pk"] == "pv")
 }
 
@@ -128,11 +135,33 @@ func TestServerWriteMetainfo(t *testing.T) {
 	ctx, err := MetainfoServerHandler.WriteMeta(ctx, msg)
 	test.Assert(t, err == nil)
 	kvs := msg.TransInfo().TransStrInfo()
-	test.Assert(t, len(kvs) == 0)
+	test.Assert(t, len(kvs) == 1 && kvs["bk"] == "bv", kvs)
 
 	msg.SetProtocolInfo(remote.NewProtocolInfo(transport.TTHeader, serviceinfo.Thrift))
 	_, err = MetainfoServerHandler.WriteMeta(ctx, msg)
 	test.Assert(t, err == nil)
 	kvs = msg.TransInfo().TransStrInfo()
 	test.Assert(t, len(kvs) == 1 && kvs["bk"] == "bv", kvs)
+}
+
+func Test_addStreamID(t *testing.T) {
+	t.Run("without-stream-log-id", func(t *testing.T) {
+		md := metadata.MD{
+			transmeta.HTTPStreamLogID: nil,
+		}
+		ctx := context.Background()
+		ctx = addStreamIDToContext(ctx, md)
+		logID := logid.GetStreamLogID(ctx)
+		test.Assert(t, logID == "", logID) // won't generate a new one
+	})
+
+	t.Run("with-stream-log-id", func(t *testing.T) {
+		md := metadata.MD{
+			transmeta.HTTPStreamLogID: []string{"test"},
+		}
+		ctx := context.Background()
+		ctx = addStreamIDToContext(ctx, md)
+		logID := logid.GetStreamLogID(ctx)
+		test.Assert(t, logID == "test", logID)
+	})
 }

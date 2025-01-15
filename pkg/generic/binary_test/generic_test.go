@@ -18,28 +18,28 @@ package test
 
 import (
 	"context"
-	"encoding/binary"
 	"net"
-	"runtime"
-	"runtime/debug"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/apache/thrift/lib/go/thrift"
+	"github.com/cloudwego/gopkg/protocol/thrift"
 
 	"github.com/cloudwego/kitex/client/callopt"
 	"github.com/cloudwego/kitex/client/genericclient"
 	kt "github.com/cloudwego/kitex/internal/mocks/thrift"
 	"github.com/cloudwego/kitex/internal/test"
 	"github.com/cloudwego/kitex/pkg/generic"
-	"github.com/cloudwego/kitex/pkg/utils"
+	"github.com/cloudwego/kitex/pkg/kerrors"
 	"github.com/cloudwego/kitex/server"
 )
+
+var addr = test.GetLocalAddress()
 
 func TestRun(t *testing.T) {
 	t.Run("RawThriftBinary", rawThriftBinary)
 	t.Run("RawThriftBinaryError", rawThriftBinaryError)
+	t.Run("RawThriftBinaryBizError", rawThriftBinaryBizError)
 	t.Run("RawThriftBinaryMockReq", rawThriftBinaryMockReq)
 	t.Run("RawThriftBinary2NormalServer", rawThriftBinary2NormalServer)
 }
@@ -47,7 +47,6 @@ func TestRun(t *testing.T) {
 func rawThriftBinary(t *testing.T) {
 	svr := initRawThriftBinaryServer(new(GenericServiceImpl))
 	defer svr.Stop()
-	time.Sleep(500 * time.Millisecond)
 
 	cli := initRawThriftBinaryClient()
 
@@ -64,7 +63,6 @@ func rawThriftBinary(t *testing.T) {
 func rawThriftBinaryError(t *testing.T) {
 	svr := initRawThriftBinaryServer(new(GenericServiceErrorImpl))
 	defer svr.Stop()
-	time.Sleep(500 * time.Millisecond)
 
 	cli := initRawThriftBinaryClient()
 
@@ -76,10 +74,26 @@ func rawThriftBinaryError(t *testing.T) {
 	test.Assert(t, strings.Contains(err.Error(), errResp), err.Error())
 }
 
+func rawThriftBinaryBizError(t *testing.T) {
+	svr := initRawThriftBinaryServer(new(GenericServiceBizErrorImpl))
+	defer svr.Stop()
+
+	cli := initRawThriftBinaryClient()
+
+	method := "myMethod"
+	buf := genBinaryReqBuf(method)
+
+	_, err := cli.GenericCall(context.Background(), method, buf)
+	test.Assert(t, err != nil)
+	bizStatusErr, ok := kerrors.FromBizStatusError(err)
+	test.Assert(t, ok)
+	test.Assert(t, bizStatusErr.BizStatusCode() == 404)
+	test.Assert(t, bizStatusErr.BizMessage() == "not found")
+}
+
 func rawThriftBinaryMockReq(t *testing.T) {
 	svr := initRawThriftBinaryServer(new(GenericServiceMockImpl))
 	defer svr.Stop()
-	time.Sleep(500 * time.Millisecond)
 
 	cli := initRawThriftBinaryClient()
 
@@ -93,8 +107,7 @@ func rawThriftBinaryMockReq(t *testing.T) {
 	args.Req = req
 
 	// encode
-	rc := utils.NewThriftMessageCodec()
-	buf, err := rc.Encode("Test", thrift.CALL, 100, args)
+	buf, err := thrift.MarshalFastMsg("Test", thrift.CALL, 100, args)
 	test.Assert(t, err == nil, err)
 
 	resp, err := cli.GenericCall(context.Background(), "Test", buf)
@@ -103,7 +116,7 @@ func rawThriftBinaryMockReq(t *testing.T) {
 	// decode
 	buf = resp.([]byte)
 	var result kt.MockTestResult
-	method, seqID, err := rc.Decode(buf, &result)
+	method, seqID, err := thrift.UnmarshalFastMsg(buf, &result)
 	test.Assert(t, err == nil, err)
 	test.Assert(t, method == "Test", method)
 	test.Assert(t, seqID != 100, seqID)
@@ -117,7 +130,6 @@ func rawThriftBinaryMockReq(t *testing.T) {
 func rawThriftBinary2NormalServer(t *testing.T) {
 	svr := initMockServer(new(MockImpl))
 	defer svr.Stop()
-	time.Sleep(500 * time.Millisecond)
 
 	cli := initRawThriftBinaryClient()
 
@@ -131,8 +143,7 @@ func rawThriftBinary2NormalServer(t *testing.T) {
 	args.Req = req
 
 	// encode
-	rc := utils.NewThriftMessageCodec()
-	buf, err := rc.Encode("Test", thrift.CALL, 100, args)
+	buf, err := thrift.MarshalFastMsg("Test", thrift.CALL, 100, args)
 	test.Assert(t, err == nil, err)
 
 	resp, err := cli.GenericCall(context.Background(), "Test", buf, callopt.WithRPCTimeout(100*time.Second))
@@ -141,7 +152,7 @@ func rawThriftBinary2NormalServer(t *testing.T) {
 	// decode
 	buf = resp.([]byte)
 	var result kt.MockTestResult
-	method, seqID, err := rc.Decode(buf, &result)
+	method, seqID, err := thrift.UnmarshalFastMsg(buf, &result)
 	test.Assert(t, err == nil, err)
 	test.Assert(t, method == "Test", method)
 	// seqID会在kitex中覆盖，避免TTHeader和Payload codec 不一致问题
@@ -151,96 +162,29 @@ func rawThriftBinary2NormalServer(t *testing.T) {
 
 func initRawThriftBinaryClient() genericclient.Client {
 	g := generic.BinaryThriftGeneric()
-	cli := newGenericClient("destServiceName", g, "127.0.0.1:9009")
+	cli := newGenericClient("destServiceName", g, addr)
 	return cli
 }
 
 func initRawThriftBinaryServer(handler generic.Service) server.Server {
-	addr, _ := net.ResolveTCPAddr("tcp", ":9009")
+	addr, _ := net.ResolveTCPAddr("tcp", addr)
 	g := generic.BinaryThriftGeneric()
 	svr := newGenericServer(g, addr, handler)
 	return svr
 }
 
 func initMockServer(handler kt.Mock) server.Server {
-	addr, _ := net.ResolveTCPAddr("tcp", ":9009")
-	svr := NewMockServer(handler, addr)
+	tcpAddr, _ := net.ResolveTCPAddr("tcp", addr)
+	svr := NewMockServer(handler, tcpAddr)
 	return svr
 }
 
 func genBinaryReqBuf(method string) []byte {
-	idx := 0
-	buf := make([]byte, 12+len(method)+len(reqMsg))
-	binary.BigEndian.PutUint32(buf, thrift.VERSION_1)
-	idx += 4
-	binary.BigEndian.PutUint32(buf[idx:idx+4], uint32(len(method)))
-	idx += 4
-	copy(buf[idx:idx+len(method)], method)
-	idx += len(method)
-	binary.BigEndian.PutUint32(buf[idx:idx+4], 100)
-	idx += 4
-	copy(buf[idx:idx+len(reqMsg)], reqMsg)
-	return buf
-}
-
-func TestBinaryThriftGenericClientClose(t *testing.T) {
-	debug.SetGCPercent(-1)
-	defer debug.SetGCPercent(100)
-
-	var ms runtime.MemStats
-	runtime.ReadMemStats(&ms)
-
-	t.Logf("Allocation: %f Mb, Number of allocation: %d\n", mb(ms.HeapAlloc), ms.HeapObjects)
-
-	clis := make([]genericclient.Client, 10000)
-	for i := 0; i < 10000; i++ {
-		g := generic.BinaryThriftGeneric()
-		clis[i] = newGenericClient("destServiceName", g, "127.0.0.1:9009")
-	}
-
-	runtime.ReadMemStats(&ms)
-	preHeapAlloc, preHeapObjects := mb(ms.HeapAlloc), ms.HeapObjects
-	t.Logf("Allocation: %f Mb, Number of allocation: %d\n", preHeapAlloc, preHeapObjects)
-
-	for _, cli := range clis {
-		_ = cli.Close()
-	}
-	runtime.GC()
-	runtime.ReadMemStats(&ms)
-	afterGCHeapAlloc, afterGCHeapObjects := mb(ms.HeapAlloc), ms.HeapObjects
-	t.Logf("Allocation: %f Mb, Number of allocation: %d\n", afterGCHeapAlloc, afterGCHeapObjects)
-	test.Assert(t, afterGCHeapAlloc < preHeapAlloc && afterGCHeapObjects < preHeapObjects)
-}
-
-func TestBinaryThriftGenericClientFinalizer(t *testing.T) {
-	debug.SetGCPercent(-1)
-	defer debug.SetGCPercent(100)
-
-	var ms runtime.MemStats
-	runtime.ReadMemStats(&ms)
-	t.Logf("Allocation: %f Mb, Number of allocation: %d\n", mb(ms.HeapAlloc), ms.HeapObjects)
-
-	clis := make([]genericclient.Client, 10000)
-	for i := 0; i < 10000; i++ {
-		g := generic.BinaryThriftGeneric()
-		clis[i] = newGenericClient("destServiceName", g, "127.0.0.1:9009")
-	}
-
-	runtime.ReadMemStats(&ms)
-	t.Logf("Allocation: %f Mb, Number of allocation: %d\n", mb(ms.HeapAlloc), ms.HeapObjects)
-
-	runtime.GC()
-	runtime.ReadMemStats(&ms)
-	firstGCHeapAlloc, firstGCHeapObjects := mb(ms.HeapAlloc), ms.HeapObjects
-	t.Logf("Allocation: %f Mb, Number of allocation: %d\n", firstGCHeapAlloc, firstGCHeapObjects)
-
-	runtime.GC()
-	runtime.ReadMemStats(&ms)
-	secondGCHeapAlloc, secondGCHeapObjects := mb(ms.HeapAlloc), ms.HeapObjects
-	t.Logf("Allocation: %f Mb, Number of allocation: %d\n", secondGCHeapAlloc, secondGCHeapObjects)
-	test.Assert(t, secondGCHeapAlloc < firstGCHeapAlloc && secondGCHeapObjects < firstGCHeapObjects)
-}
-
-func mb(byteSize uint64) float32 {
-	return float32(byteSize) / float32(1024*1024)
+	// no idea for reqMsg part, it's not binary protocol.
+	// DO NOT TOUCH IT or you may need to change the tests as well
+	n := thrift.Binary.MessageBeginLength(method) + len(reqMsg)
+	b := make([]byte, 0, n)
+	b = thrift.Binary.AppendMessageBegin(b, method, 0, 100)
+	b = append(b, reqMsg...)
+	return b
 }

@@ -23,20 +23,23 @@ import (
 	"strings"
 	"text/template"
 
+	genfastpb "github.com/cloudwego/fastpb/protoc-gen-fastpb/generator"
+	"github.com/cloudwego/thriftgo/generator/golang/streaming"
 	gengo "google.golang.org/protobuf/cmd/protoc-gen-go/internal_gengo"
 	"google.golang.org/protobuf/compiler/protogen"
 
 	"github.com/cloudwego/kitex/tool/internal_pkg/generator"
+	"github.com/cloudwego/kitex/tool/internal_pkg/log"
 	"github.com/cloudwego/kitex/tool/internal_pkg/util"
 )
 
 type protocPlugin struct {
 	generator.Config
 	generator.PackageInfo
-	Services           []*generator.ServiceInfo
-	kg                 generator.Generator
-	completeImportPath bool // indicates whether proto file go_package contains complete package path
-	err                error
+	Services    []*generator.ServiceInfo
+	kg          generator.Generator
+	err         error
+	importPaths map[string]string // file -> import path
 }
 
 // Name implements the protobuf_generator.Plugin interface.
@@ -48,6 +51,31 @@ func (pp *protocPlugin) Name() string {
 func (pp *protocPlugin) init() {
 	pp.Dependencies = map[string]string{
 		"proto": "google.golang.org/protobuf/proto",
+	}
+}
+
+// parse the 'M*' option
+// See https://developers.google.com/protocol-buffers/docs/reference/go-generated for more information.
+func (pp *protocPlugin) parseM() {
+	pp.importPaths = make(map[string]string)
+	for _, po := range pp.Config.ProtobufOptions {
+		if po == "" || po[0] != 'M' {
+			continue
+		}
+		idx := strings.Index(po, "=")
+		if idx < 0 {
+			continue
+		}
+		key := po[1:idx]
+		val := po[idx+1:]
+		if val == "" {
+			continue
+		}
+		idx = strings.Index(val, ";")
+		if idx >= 0 {
+			val = val[:idx]
+		}
+		pp.importPaths[key] = val
 	}
 }
 
@@ -93,13 +121,18 @@ func (pp *protocPlugin) GenerateFile(gen *protogen.Plugin, file *protogen.File) 
 		return
 	}
 	gopkg := file.Proto.GetOptions().GetGoPackage()
-	if pp.completeImportPath {
-		if parts := strings.SplitN(gopkg, generator.KitexGenPath, 2); len(parts) == 2 {
-			pp.Namespace = parts[1]
-		}
-	} else {
-		pp.Namespace = strings.TrimPrefix(gopkg, pp.PackagePrefix)
+	if !strings.HasPrefix(gopkg, pp.PackagePrefix) {
+		log.Warnf("[WARN] %q is skipped because its import path %q is not located in ./kitex_gen. Change the go_package option or use '--protobuf M%s=A-Import-Path-In-kitex_gen' to override it if you want this file to be generated under kitex_gen.\n",
+			file.Proto.GetName(), gopkg, file.Proto.GetName())
+		return
 	}
+	log.Infof("[INFO] Generate %q at %q\n", file.Proto.GetName(), gopkg)
+
+	if parts := strings.Split(gopkg, ";"); len(parts) > 1 {
+		gopkg = parts[0] // remove package alias from file path
+	}
+	pp.Namespace = strings.TrimPrefix(gopkg, pp.PackagePrefix)
+	pp.IDLName = util.IDLName(pp.Config.IDL)
 
 	ss := pp.convertTypes(file)
 	pp.Services = append(pp.Services, ss...)
@@ -132,17 +165,26 @@ func (pp *protocPlugin) GenerateFile(gen *protogen.Plugin, file *protogen.File) 
 		f.QualifiedGoIdent(protogen.GoIdent{GoImportPath: "context"})
 		if hasStreaming {
 			f.QualifiedGoIdent(protogen.GoIdent{
-				GoImportPath: protogen.GoImportPath(generator.ImportPathTo("pkg/streaming")),
+				GoImportPath: "github.com/cloudwego/kitex/pkg/streaming",
 			})
 		}
 		f.P("var _ context.Context")
 
-		tpl := template.New("interface")
-		tpl = template.Must(tpl.Parse(interfaceTemplate))
-		var buf bytes.Buffer
-		pp.err = tpl.ExecuteTemplate(&buf, tpl.Name(), pp.makeInterfaces(f, file))
+		if len(file.Services) != 0 {
+			tpl := template.New("interface")
+			tpl = template.Must(tpl.Parse(interfaceTemplate))
+			var buf bytes.Buffer
+			pp.err = tpl.ExecuteTemplate(&buf, tpl.Name(), pp.makeInterfaces(f, file))
 
-		f.P(buf.String())
+			f.P(buf.String())
+		}
+	}
+
+	// generate fast api
+	if !pp.Config.NoFastAPI && pp.err == nil {
+		fixed := *file
+		fixed.GeneratedFilenamePrefix = strings.TrimPrefix(fixed.GeneratedFilenamePrefix, pp.PackagePrefix)
+		genfastpb.GenerateFile(gen, &fixed)
 	}
 }
 
@@ -175,8 +217,35 @@ func (pp *protocPlugin) process(gen *protogen.Plugin) {
 			gen.Error(errors.New("no service defined"))
 			return
 		}
-		pp.ServiceInfo = pp.Services[len(pp.Services)-1]
+		if !pp.IsUsingMultipleServicesTpl() {
+			// if -tpl multiple_services is not set, specify the last service as the target service
+			pp.ServiceInfo = pp.Services[len(pp.Services)-1]
+		} else {
+			var svcs []*generator.ServiceInfo
+			for _, svc := range pp.Services {
+				if svc.GenerateHandler {
+					svc.RefName = "service" + svc.ServiceName
+					svcs = append(svcs, svc)
+				}
+			}
+			pp.PackageInfo.Services = svcs
+		}
 		fs, err := pp.kg.GenerateMainPackage(&pp.PackageInfo)
+		if err != nil {
+			pp.err = err
+		}
+		for _, f := range fs {
+			gen.NewGeneratedFile(pp.adjustPath(f.Name), "").P(f.Content)
+		}
+	}
+
+	if pp.Config.TemplateDir != "" {
+		if len(pp.Services) == 0 {
+			gen.Error(errors.New("no service defined"))
+			return
+		}
+		pp.ServiceInfo = pp.Services[len(pp.Services)-1]
+		fs, err := pp.kg.GenerateCustomPackage(&pp.PackageInfo)
 		if err != nil {
 			pp.err = err
 		}
@@ -231,6 +300,12 @@ func (pp *protocPlugin) convertTypes(file *protogen.File) (ss []*generator.Servi
 				si.HasStreaming = true
 			}
 		}
+		for _, m := range si.Methods {
+			BuildStreaming(m, si.HasStreaming)
+		}
+		if file.Generate {
+			si.GenerateHandler = true
+		}
 		ss = append(ss, si)
 	}
 	// combine service
@@ -245,7 +320,8 @@ func (pp *protocPlugin) convertTypes(file *protogen.File) (ss []*generator.Servi
 		mm := make(map[string]*generator.MethodInfo)
 		for _, m := range methods {
 			if _, ok := mm[m.Name]; ok {
-				println(fmt.Sprintf("combine service method %s in %s conflicts with %s in %s", m.Name, m.ServiceName, m.Name, mm[m.Name].ServiceName))
+				log.Warnf("[WARN] combine service method %s in %s conflicts with %s in %s\n",
+					m.Name, m.ServiceName, m.Name, mm[m.Name].ServiceName)
 				return
 			}
 			mm[m.Name] = m
@@ -269,6 +345,29 @@ func (pp *protocPlugin) convertTypes(file *protogen.File) (ss []*generator.Servi
 		ss = append(ss, si)
 	}
 	return
+}
+
+// BuildStreaming builds protobuf MethodInfo.Streaming as for Thrift, to simplify codegen
+func BuildStreaming(mi *generator.MethodInfo, serviceHasStreaming bool) {
+	s := &streaming.Streaming{
+		// pb: if one method is streaming, then the service is streaming, making all methods streaming
+		IsStreaming: serviceHasStreaming,
+	}
+	if mi.ClientStreaming && mi.ServerStreaming {
+		s.Mode = streaming.StreamingBidirectional
+		s.BidirectionalStreaming = true
+		s.ClientStreaming = true
+		s.ServerStreaming = true
+	} else if mi.ClientStreaming && !mi.ServerStreaming {
+		s.Mode = streaming.StreamingClientSide
+		s.ClientStreaming = true
+	} else if !mi.ClientStreaming && mi.ServerStreaming {
+		s.Mode = streaming.StreamingServerSide
+		s.ServerStreaming = true
+	} else if serviceHasStreaming {
+		s.Mode = streaming.StreamingUnary // Unary APIs over HTTP2
+	}
+	mi.Streaming = s
 }
 
 func (pp *protocPlugin) getCombineServiceName(name string, svcs []*generator.ServiceInfo) string {
@@ -332,15 +431,15 @@ func (pp *protocPlugin) makeInterfaces(gf *protogen.GeneratedFile, file *protoge
 func (pp *protocPlugin) adjustPath(path string) (ret string) {
 	cur, _ := filepath.Abs(".")
 	if pp.Config.Use == "" {
-		cur = filepath.Join(cur, generator.KitexGenPath)
+		cur = util.JoinPath(cur, generator.KitexGenPath)
 	}
 	if filepath.IsAbs(path) {
 		path, _ = filepath.Rel(cur, path)
 		return path
 	}
 	if pp.ModuleName == "" {
-		gopath := util.GetGOPATH()
-		path = filepath.Join(gopath, "src", path)
+		gopath, _ := util.GetGOPATH()
+		path = util.JoinPath(gopath, "src", path)
 		path, _ = filepath.Rel(cur, path)
 	} else {
 		path, _ = filepath.Rel(pp.ModuleName, path)

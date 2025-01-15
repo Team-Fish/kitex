@@ -20,10 +20,10 @@ import (
 	"context"
 	"net"
 
-	stats2 "github.com/cloudwego/kitex/internal/stats"
 	"github.com/cloudwego/kitex/pkg/kerrors"
 	"github.com/cloudwego/kitex/pkg/klog"
 	"github.com/cloudwego/kitex/pkg/remote"
+	"github.com/cloudwego/kitex/pkg/rpcinfo"
 	"github.com/cloudwego/kitex/pkg/stats"
 )
 
@@ -44,30 +44,30 @@ type cliTransHandler struct {
 }
 
 // Write implements the remote.ClientTransHandler interface.
-func (t *cliTransHandler) Write(ctx context.Context, conn net.Conn, sendMsg remote.Message) (err error) {
+func (t *cliTransHandler) Write(ctx context.Context, conn net.Conn, sendMsg remote.Message) (nctx context.Context, err error) {
 	var bufWriter remote.ByteBuffer
-	stats2.Record(ctx, sendMsg.RPCInfo(), stats.WriteStart, nil)
+	rpcinfo.Record(ctx, sendMsg.RPCInfo(), stats.WriteStart, nil)
 	defer func() {
 		t.ext.ReleaseBuffer(bufWriter, err)
-		stats2.Record(ctx, sendMsg.RPCInfo(), stats.WriteFinish, err)
+		rpcinfo.Record(ctx, sendMsg.RPCInfo(), stats.WriteFinish, err)
 	}()
 
 	bufWriter = t.ext.NewWriteByteBuffer(ctx, conn, sendMsg)
 	sendMsg.SetPayloadCodec(t.opt.PayloadCodec)
 	err = t.codec.Encode(ctx, sendMsg, bufWriter)
 	if err != nil {
-		return err
+		return ctx, err
 	}
-	return bufWriter.Flush()
+	return ctx, bufWriter.Flush()
 }
 
 // Read implements the remote.ClientTransHandler interface.
-func (t *cliTransHandler) Read(ctx context.Context, conn net.Conn, recvMsg remote.Message) (err error) {
+func (t *cliTransHandler) Read(ctx context.Context, conn net.Conn, recvMsg remote.Message) (nctx context.Context, err error) {
 	var bufReader remote.ByteBuffer
-	stats2.Record(ctx, recvMsg.RPCInfo(), stats.ReadStart, nil)
+	rpcinfo.Record(ctx, recvMsg.RPCInfo(), stats.ReadStart, nil)
 	defer func() {
 		t.ext.ReleaseBuffer(bufReader, err)
-		stats2.Record(ctx, recvMsg.RPCInfo(), stats.ReadFinish, err)
+		rpcinfo.Record(ctx, recvMsg.RPCInfo(), stats.ReadFinish, err)
 	}()
 
 	t.ext.SetReadTimeout(ctx, conn, recvMsg.RPCInfo().Config(), recvMsg.RPCRole())
@@ -78,10 +78,10 @@ func (t *cliTransHandler) Read(ctx context.Context, conn net.Conn, recvMsg remot
 		if t.ext.IsTimeoutErr(err) {
 			err = kerrors.ErrRPCTimeout.WithCause(err)
 		}
-		return err
+		return ctx, err
 	}
 
-	return nil
+	return ctx, nil
 }
 
 // OnMessage implements the remote.ClientTransHandler interface.

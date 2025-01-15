@@ -26,12 +26,12 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/cloudwego/kitex/pkg/remote/trans"
+	"github.com/cloudwego/netpoll"
 
 	"github.com/cloudwego/kitex/pkg/klog"
 	"github.com/cloudwego/kitex/pkg/remote"
+	"github.com/cloudwego/kitex/pkg/remote/trans"
 	"github.com/cloudwego/kitex/pkg/utils"
-	"github.com/cloudwego/netpoll"
 )
 
 // NewTransServerFactory creates a default netpoll transport server factory.
@@ -64,20 +64,21 @@ type transServer struct {
 var _ remote.TransServer = &transServer{}
 
 // CreateListener implements the remote.TransServer interface.
-func (ts *transServer) CreateListener(addr net.Addr) (_ net.Listener, err error) {
+func (ts *transServer) CreateListener(addr net.Addr) (net.Listener, error) {
 	if addr.Network() == "unix" {
 		syscall.Unlink(addr.String())
 	}
 	// The network must be "tcp", "tcp4", "tcp6" or "unix".
-	ts.ln, err = ts.lncfg.Listen(context.Background(), addr.Network(), addr.String())
-	return ts.ln, err
+	ln, err := ts.lncfg.Listen(context.Background(), addr.Network(), addr.String())
+	return ln, err
 }
 
 // BootstrapServer implements the remote.TransServer interface.
-func (ts *transServer) BootstrapServer() (err error) {
-	if ts.ln == nil {
+func (ts *transServer) BootstrapServer(ln net.Listener) (err error) {
+	if ln == nil {
 		return errors.New("listener is nil in netpoll transport server")
 	}
+	ts.ln = ln
 	opts := []netpoll.Option{
 		netpoll.WithIdleTimeout(ts.opt.MaxConnectionIdleTime),
 		netpoll.WithReadTimeout(ts.opt.ReadWriteTimeout),
@@ -114,7 +115,10 @@ func (ts *transServer) Shutdown() (err error) {
 			ts.ln.Close()
 
 			// 2. signal all active connections to close gracefully
-			g.GracefulShutdown(ctx)
+			err = g.GracefulShutdown(ctx)
+			if err != nil {
+				klog.Warnf("KITEX: server graceful shutdown error: %v", err)
+			}
 		}
 	}
 	if ts.evl != nil {
@@ -134,7 +138,7 @@ func (ts *transServer) ConnCount() utils.AtomicInt {
 // 2. Doesn't need to init RPCInfo if it's not RPC request, such as heartbeat.
 func (ts *transServer) onConnActive(conn netpoll.Connection) context.Context {
 	ctx := context.Background()
-	defer transRecover(ctx, conn, "OnActive")
+	defer transRecover(ctx, conn, "OnActive", false)
 	conn.AddCloseCallback(func(connection netpoll.Connection) error {
 		ts.onConnInactive(ctx, conn)
 		return nil
@@ -150,16 +154,23 @@ func (ts *transServer) onConnActive(conn netpoll.Connection) context.Context {
 }
 
 func (ts *transServer) onConnRead(ctx context.Context, conn netpoll.Connection) error {
+	// in case it's panicked, it may caused by framework,
+	// try to propagate the err and let it crash.
+	// we mainly use transRecover for logging
+	defer transRecover(ctx, conn, "onConnRead", true)
 	err := ts.transHdlr.OnRead(ctx, conn)
 	if err != nil {
 		ts.onError(ctx, err, conn)
-		conn.Close()
+		if conn != nil {
+			// close the connection if OnRead return error
+			conn.Close()
+		}
 	}
 	return nil
 }
 
 func (ts *transServer) onConnInactive(ctx context.Context, conn netpoll.Connection) {
-	defer transRecover(ctx, conn, "OnInactive")
+	defer transRecover(ctx, conn, "OnInactive", false)
 	ts.connCount.Dec()
 	ts.transHdlr.OnInactive(ctx, conn)
 }
@@ -168,13 +179,16 @@ func (ts *transServer) onError(ctx context.Context, err error, conn netpoll.Conn
 	ts.transHdlr.OnError(ctx, err, conn)
 }
 
-func transRecover(ctx context.Context, conn netpoll.Connection, funcName string) {
+func transRecover(ctx context.Context, conn netpoll.Connection, funcName string, propagatePanic bool) {
 	panicErr := recover()
 	if panicErr != nil {
 		if conn != nil {
 			klog.CtxErrorf(ctx, "KITEX: panic happened in %s, remoteAddress=%s, error=%v\nstack=%s", funcName, conn.RemoteAddr(), panicErr, string(debug.Stack()))
 		} else {
 			klog.CtxErrorf(ctx, "KITEX: panic happened in %s, error=%v\nstack=%s", funcName, panicErr, string(debug.Stack()))
+		}
+		if propagatePanic {
+			panic(panicErr)
 		}
 	}
 }

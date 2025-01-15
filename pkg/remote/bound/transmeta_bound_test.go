@@ -21,15 +21,17 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/cloudwego/kitex/internal/mocks"
+	"github.com/bytedance/gopkg/cloud/metainfo"
+	"github.com/golang/mock/gomock"
+
+	mocksremote "github.com/cloudwego/kitex/internal/mocks/remote"
 	"github.com/cloudwego/kitex/internal/test"
 	"github.com/cloudwego/kitex/pkg/consts"
 	"github.com/cloudwego/kitex/pkg/remote"
+	"github.com/cloudwego/kitex/pkg/remote/trans/invoke"
 	"github.com/cloudwego/kitex/pkg/rpcinfo"
 	"github.com/cloudwego/kitex/pkg/rpcinfo/remoteinfo"
-	"github.com/golang/mock/gomock"
-
-	"github.com/cloudwego/kitex/pkg/remote/trans/invoke"
+	"github.com/cloudwego/kitex/pkg/transmeta"
 )
 
 // TestNewTransMetaHandler test NewTransMetaHandler function and assert the result not nil.
@@ -37,9 +39,9 @@ func TestNewTransMetaHandler(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	metaHandler1 := mocks.NewMockMetaHandler(ctrl)
-	metaHandler2 := mocks.NewMockMetaHandler(ctrl)
-	metaHandler3 := mocks.NewMockMetaHandler(ctrl)
+	metaHandler1 := mocksremote.NewMockMetaHandler(ctrl)
+	metaHandler2 := mocksremote.NewMockMetaHandler(ctrl)
+	metaHandler3 := mocksremote.NewMockMetaHandler(ctrl)
 	mhs := []remote.MetaHandler{
 		metaHandler1, metaHandler2, metaHandler3,
 	}
@@ -55,9 +57,9 @@ func TestTransMetaHandlerWrite(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		defer ctrl.Finish()
 
-		metaHandler1 := mocks.NewMockMetaHandler(ctrl)
-		metaHandler2 := mocks.NewMockMetaHandler(ctrl)
-		metaHandler3 := mocks.NewMockMetaHandler(ctrl)
+		metaHandler1 := mocksremote.NewMockMetaHandler(ctrl)
+		metaHandler2 := mocksremote.NewMockMetaHandler(ctrl)
+		metaHandler3 := mocksremote.NewMockMetaHandler(ctrl)
 
 		invokeMessage := invoke.NewMessage(nil, nil)
 		remoteMessage := remote.NewMessage(
@@ -99,9 +101,9 @@ func TestTransMetaHandlerWrite(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		defer ctrl.Finish()
 
-		metaHandler1 := mocks.NewMockMetaHandler(ctrl)
-		metaHandler2 := mocks.NewMockMetaHandler(ctrl)
-		metaHandler3 := mocks.NewMockMetaHandler(ctrl)
+		metaHandler1 := mocksremote.NewMockMetaHandler(ctrl)
+		metaHandler2 := mocksremote.NewMockMetaHandler(ctrl)
+		metaHandler3 := mocksremote.NewMockMetaHandler(ctrl)
 
 		invokeMessage := invoke.NewMessage(nil, nil)
 		remoteMessage := remote.NewMessage(
@@ -131,9 +133,9 @@ func TestTransMetaHandlerOnMessage(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		defer ctrl.Finish()
 
-		metaHandler1 := mocks.NewMockMetaHandler(ctrl)
-		metaHandler2 := mocks.NewMockMetaHandler(ctrl)
-		metaHandler3 := mocks.NewMockMetaHandler(ctrl)
+		metaHandler1 := mocksremote.NewMockMetaHandler(ctrl)
+		metaHandler2 := mocksremote.NewMockMetaHandler(ctrl)
+		metaHandler3 := mocksremote.NewMockMetaHandler(ctrl)
 
 		args := remote.NewMessage(
 			nil, nil, nil, remote.Call, remote.Client)
@@ -176,9 +178,9 @@ func TestTransMetaHandlerOnMessage(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		defer ctrl.Finish()
 
-		metaHandler1 := mocks.NewMockMetaHandler(ctrl)
-		metaHandler2 := mocks.NewMockMetaHandler(ctrl)
-		metaHandler3 := mocks.NewMockMetaHandler(ctrl)
+		metaHandler1 := mocksremote.NewMockMetaHandler(ctrl)
+		metaHandler2 := mocksremote.NewMockMetaHandler(ctrl)
+		metaHandler3 := mocksremote.NewMockMetaHandler(ctrl)
 
 		ink := rpcinfo.NewInvocation("", "mock")
 		to := remoteinfo.NewRemoteInfo(&rpcinfo.EndpointBasicInfo{}, "")
@@ -203,6 +205,51 @@ func TestTransMetaHandlerOnMessage(t *testing.T) {
 		ctx, err := handler.OnMessage(ctx, args, result)
 		test.Assert(t, err == nil)
 		test.Assert(t, ctx != nil && args.RPCInfo().To().Method() == ctx.Value(consts.CtxKeyMethod))
+	})
+
+	t.Run("Test metainfo transient key", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+
+		metaHandler1 := transmeta.MetainfoServerHandler
+		metaHandler2 := mocksremote.NewMockMetaHandler(ctrl)
+
+		ink := rpcinfo.NewInvocation("", "mock")
+		to := remoteinfo.NewRemoteInfo(&rpcinfo.EndpointBasicInfo{}, "")
+		ri := rpcinfo.NewRPCInfo(nil, to, ink, nil, nil)
+
+		args := remote.NewMessage(
+			nil, nil, ri, remote.Call, remote.Server)
+		result := remote.NewMessage(
+			nil, nil, nil, remote.Reply, remote.Server)
+		ctx := context.Background()
+
+		tk1, tv1 := "tk1", "tv1"
+		tk2, tv2 := "tk2", "tv2"
+		args.TransInfo().PutTransStrInfo(map[string]string{metainfo.PrefixTransient + tk1: tv1})
+		metaHandler2.EXPECT().ReadMeta(gomock.Any(), args).DoAndReturn(func(ctx context.Context, msg remote.Message) (context.Context, error) {
+			ctx = metainfo.SetMetaInfoFromMap(ctx, map[string]string{metainfo.PrefixTransient + tk2: tv2})
+			return ctx, nil
+		}).Times(1)
+		mhs := []remote.MetaHandler{
+			metaHandler1, metaHandler2,
+		}
+
+		handler := NewTransMetaHandler(mhs)
+
+		test.Assert(t, handler != nil)
+		ctx, err := handler.OnMessage(ctx, args, result)
+		test.Assert(t, err == nil)
+		v, ok := metainfo.GetValue(ctx, tk1)
+		test.Assert(t, ok)
+		test.Assert(t, v == tv1)
+		v, ok = metainfo.GetValue(ctx, tk2)
+		test.Assert(t, ok)
+		test.Assert(t, v == tv2)
+
+		kvs := make(map[string]string)
+		metainfo.SaveMetaInfoToMap(ctx, kvs)
+		test.Assert(t, len(kvs) == 0)
 	})
 }
 
@@ -231,7 +278,7 @@ func TestTransMetaHandlerOnActive(t *testing.T) {
 	defer ctrl.Finish()
 
 	mhs := []remote.MetaHandler{
-		mocks.NewMockMetaHandler(ctrl),
+		mocksremote.NewMockMetaHandler(ctrl),
 	}
 	ctx := context.Background()
 	handler := NewTransMetaHandler(mhs)
@@ -246,7 +293,7 @@ func TestTransMetaHandlerOnRead(t *testing.T) {
 	defer ctrl.Finish()
 
 	mhs := []remote.MetaHandler{
-		mocks.NewMockMetaHandler(ctrl),
+		mocksremote.NewMockMetaHandler(ctrl),
 	}
 	ctx := context.Background()
 	handler := NewTransMetaHandler(mhs)
@@ -261,7 +308,7 @@ func TestTransMetaHandlerOnInactive(t *testing.T) {
 	defer ctrl.Finish()
 
 	mhs := []remote.MetaHandler{
-		mocks.NewMockMetaHandler(ctrl),
+		mocksremote.NewMockMetaHandler(ctrl),
 	}
 	ctx := context.Background()
 	handler := NewTransMetaHandler(mhs)

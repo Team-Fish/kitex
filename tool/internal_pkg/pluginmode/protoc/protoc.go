@@ -17,7 +17,6 @@ package protoc
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,24 +26,26 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/pluginpb"
 
-	"github.com/cloudwego/kitex/tool/internal_pkg/generator"
+	"github.com/cloudwego/kitex/tool/internal_pkg/log"
+	"github.com/cloudwego/kitex/tool/internal_pkg/util"
 )
 
 // PluginName .
 const PluginName = "protoc-gen-kitex"
 
+// Run .
 func Run() int {
 	opts := protogen.Options{}
-	if err := run(opts); err != nil {
+	if err := DoRun(opts); err != nil {
 		fmt.Fprintf(os.Stderr, "%s: %v\n", filepath.Base(os.Args[0]), err)
 		return 1
 	}
 	return 0
 }
 
-func run(opts protogen.Options) error {
+func DoRun(opts protogen.Options) error {
 	// unmarshal request from stdin
-	in, err := ioutil.ReadAll(os.Stdin)
+	in, err := util.ReadInput()
 	if err != nil {
 		return err
 	}
@@ -53,54 +54,10 @@ func run(opts protogen.Options) error {
 		return err
 	}
 
-	// init plugin
-	pp := new(protocPlugin)
-	pp.init()
-	args := strings.Split(req.GetParameter(), ",")
-	err = pp.Unpack(args)
-	if err != nil {
-		return fmt.Errorf("%s: unpack args: %w", PluginName, err)
-	}
-
-	// check GoPackage
-	for _, f := range req.ProtoFile {
-		if f == nil {
-			return errors.New("ERROR: got nil ProtoFile")
-		}
-		if f.Options == nil || f.Options.GoPackage == nil {
-			return fmt.Errorf("ERROR: go_package is missing in proto file %s", *f.Name)
-		}
-	}
-
-	for _, f := range req.ProtoFile {
-		if strings.Contains(*f.Options.GoPackage, generator.KitexGenPath) {
-			pp.completeImportPath = true
-		}
-	}
-	if pp.completeImportPath {
-		println("WARNING: you should not use go_package with complete package path any more," +
-			"use package name like thrift namespace instead of complete package path.")
-	}
-	// fix proto file go_package to correct dependency import
-	for _, f := range req.ProtoFile {
-		if !strings.Contains(*f.Options.GoPackage, generator.KitexGenPath) {
-			if pp.completeImportPath {
-				return errors.New("mix use of new/old proto file standard")
-			}
-			f.Options.GoPackage = &(&struct{ x string }{filepath.Join(pp.PackagePrefix, *f.Options.GoPackage)}).x
-		}
-	}
-
-	// generate files
-	gen, err := opts.New(req)
+	resp, err := GenKitex(req, opts)
 	if err != nil {
 		return err
 	}
-	pp.process(gen)
-	gen.SupportedFeatures = gengo.SupportedFeatures
-
-	// construct plugin response
-	resp := gen.Response()
 	out, err := proto.Marshal(resp)
 	if err != nil {
 		return err
@@ -109,4 +66,54 @@ func run(opts protogen.Options) error {
 		return err
 	}
 	return nil
+}
+
+func GenKitex(req *pluginpb.CodeGeneratorRequest, opts protogen.Options) (*pluginpb.CodeGeneratorResponse, error) {
+	// init plugin
+	pp := new(protocPlugin)
+	pp.init()
+	args := strings.Split(req.GetParameter(), ",")
+	err := pp.Unpack(args)
+	if err != nil {
+		return nil, fmt.Errorf("%s: unpack args: %w", PluginName, err)
+	}
+
+	pp.parseM()
+
+	// unify go_package
+	pe := &pathElements{
+		module: pp.ModuleName,
+		prefix: pp.PackagePrefix,
+	}
+	for _, f := range req.ProtoFile {
+		if f == nil {
+			return nil, errors.New("ERROR: got nil ProtoFile")
+		}
+
+		gopkg, ok := pp.importPaths[f.GetName()]
+		if ok {
+			f.Options.GoPackage = &gopkg
+			log.Infof("[INFO] option specified import path for %q: %q\n", f.GetName(), gopkg)
+		} else {
+			if f.Options == nil || f.Options.GoPackage == nil {
+				return nil, fmt.Errorf("ERROR: go_package is missing in proto file %q", f.GetName())
+			}
+			gopkg = f.GetOptions().GetGoPackage()
+		}
+		if path, ok := pe.getImportPath(gopkg); ok {
+			f.Options.GoPackage = &path
+			log.Infof("[INFO] update import path for %q: %q -> %q\n", f.GetName(), gopkg, path)
+		}
+	}
+
+	// generate files
+	gen, err := opts.New(req)
+	if err != nil {
+		return nil, err
+	}
+	pp.process(gen)
+	gen.SupportedFeatures = gengo.SupportedFeatures
+	// construct plugin response
+	resp := gen.Response()
+	return resp, nil
 }
