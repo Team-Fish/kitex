@@ -21,12 +21,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cloudwego/netpoll"
+
 	"github.com/cloudwego/kitex/internal/test"
 	"github.com/cloudwego/kitex/pkg/remote"
 	"github.com/cloudwego/kitex/pkg/remote/codec"
 	"github.com/cloudwego/kitex/pkg/rpcinfo"
 	"github.com/cloudwego/kitex/pkg/serviceinfo"
-	"github.com/cloudwego/netpoll"
 )
 
 // TestOnRequest test muxSvrConn OnRequest return Err
@@ -101,7 +102,8 @@ func TestOnRequest(t *testing.T) {
 			}
 		},
 	}
-	err = handler.Write(ctx, conn, msg)
+	ctx, err = handler.Write(ctx, conn, msg)
+	test.Assert(t, ctx != nil, ctx)
 	test.Assert(t, err == nil, err)
 
 	time.Sleep(5 * time.Millisecond)

@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/cloudwego/kitex/pkg/kerrors"
+	"github.com/cloudwego/kitex/pkg/serviceinfo"
 	"github.com/cloudwego/kitex/transport"
 )
 
@@ -36,7 +37,7 @@ var (
 	defaultConnectTimeout   = time.Millisecond * 50
 	defaultReadWriteTimeout = time.Second * 5
 	defaultBufferSize       = 4096
-	defaultInteractionMode  = Unary
+	defaultInteractionMode  = PingPong
 )
 
 // Mask bits.
@@ -50,7 +51,7 @@ const (
 type InteractionMode int32
 
 const (
-	Unary     InteractionMode = 0
+	PingPong  InteractionMode = 0
 	Oneway    InteractionMode = 1
 	Streaming InteractionMode = 2
 )
@@ -64,6 +65,10 @@ type rpcConfig struct {
 	ioBufferSize      int
 	transportProtocol transport.Protocol
 	interactionMode   InteractionMode
+	payloadCodec      serviceinfo.PayloadCodec
+
+	// stream config
+	streamRecvTimeout time.Duration
 }
 
 func init() {
@@ -71,7 +76,9 @@ func init() {
 }
 
 func newRPCConfig() interface{} {
-	return &rpcConfig{}
+	c := &rpcConfig{}
+	c.initialize()
+	return c
 }
 
 // LockConfig sets the bits of readonly mask to prevent sequential modification on certain configs.
@@ -162,7 +169,13 @@ func (r *rpcConfig) TransportProtocol() transport.Protocol {
 
 // SetTransportProtocol implements MutableRPCConfig interface.
 func (r *rpcConfig) SetTransportProtocol(tp transport.Protocol) error {
-	r.transportProtocol |= tp
+	// PurePayload would override all the bits set before
+	// since in previous implementation, r.transport |= transport.PurePayload would not take effect
+	if tp == transport.PurePayload {
+		r.transportProtocol = tp
+	} else {
+		r.transportProtocol |= tp
+	}
 	return nil
 }
 
@@ -175,6 +188,22 @@ func (r *rpcConfig) InteractionMode() InteractionMode {
 	return r.interactionMode
 }
 
+func (r *rpcConfig) SetPayloadCodec(codec serviceinfo.PayloadCodec) {
+	r.payloadCodec = codec
+}
+
+func (r *rpcConfig) PayloadCodec() serviceinfo.PayloadCodec {
+	return r.payloadCodec
+}
+
+func (r *rpcConfig) SetStreamRecvTimeout(timeout time.Duration) {
+	r.streamRecvTimeout = timeout
+}
+
+func (r *rpcConfig) StreamRecvTimeout() time.Duration {
+	return r.streamRecvTimeout
+}
+
 // Clone returns a copy of the current rpcConfig.
 func (r *rpcConfig) Clone() MutableRPCConfig {
 	r2 := rpcConfigPool.Get().(*rpcConfig)
@@ -182,28 +211,29 @@ func (r *rpcConfig) Clone() MutableRPCConfig {
 	return r2
 }
 
-func (r *rpcConfig) zero() {
-	r.rpcTimeout = 0
-	r.transportProtocol = 0
-	r.connectTimeout = 0
-	r.ioBufferSize = 0
+func (r *rpcConfig) CopyFrom(from RPCConfig) {
+	f := from.(*rpcConfig)
+	*r = *f
+}
+
+func (r *rpcConfig) initialize() {
 	r.readOnlyMask = 0
-	r.readWriteTimeout = 0
+	r.rpcTimeout = defaultRPCTimeout
+	r.connectTimeout = defaultConnectTimeout
+	r.readWriteTimeout = defaultReadWriteTimeout
+	r.ioBufferSize = defaultBufferSize
+	r.transportProtocol = 0
+	r.interactionMode = defaultInteractionMode
 }
 
 // Recycle reuses the rpcConfig.
 func (r *rpcConfig) Recycle() {
-	r.zero()
+	r.initialize()
 	rpcConfigPool.Put(r)
 }
 
 // NewRPCConfig creates a default RPCConfig.
 func NewRPCConfig() RPCConfig {
 	r := rpcConfigPool.Get().(*rpcConfig)
-	r.rpcTimeout = defaultRPCTimeout
-	r.connectTimeout = defaultConnectTimeout
-	r.readWriteTimeout = defaultReadWriteTimeout
-	r.ioBufferSize = defaultBufferSize
-	r.interactionMode = defaultInteractionMode
 	return r
 }

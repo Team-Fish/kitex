@@ -21,12 +21,12 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/cloudwego/kitex/internal/mocks"
-	"github.com/cloudwego/kitex/pkg/remote"
 	"github.com/golang/mock/gomock"
 
+	mockslimiter "github.com/cloudwego/kitex/internal/mocks/limiter"
 	"github.com/cloudwego/kitex/internal/test"
 	"github.com/cloudwego/kitex/pkg/kerrors"
+	"github.com/cloudwego/kitex/pkg/remote"
 	"github.com/cloudwego/kitex/pkg/remote/trans/invoke"
 )
 
@@ -37,9 +37,9 @@ func TestNewServerLimiterHandler(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	concurrencyLimiter := mocks.NewMockConcurrencyLimiter(ctrl)
-	rateLimiter := mocks.NewMockRateLimiter(ctrl)
-	limitReporter := mocks.NewMockLimitReporter(ctrl)
+	concurrencyLimiter := mockslimiter.NewMockConcurrencyLimiter(ctrl)
+	rateLimiter := mockslimiter.NewMockRateLimiter(ctrl)
+	limitReporter := mockslimiter.NewMockLimitReporter(ctrl)
 
 	handler := NewServerLimiterHandler(concurrencyLimiter, rateLimiter, limitReporter, true)
 	test.Assert(t, handler != nil)
@@ -54,9 +54,9 @@ func TestLimiterOnActive(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		defer ctrl.Finish()
 
-		concurrencyLimiter := mocks.NewMockConcurrencyLimiter(ctrl)
-		rateLimiter := mocks.NewMockRateLimiter(ctrl)
-		limitReporter := mocks.NewMockLimitReporter(ctrl)
+		concurrencyLimiter := mockslimiter.NewMockConcurrencyLimiter(ctrl)
+		rateLimiter := mockslimiter.NewMockRateLimiter(ctrl)
+		limitReporter := mockslimiter.NewMockLimitReporter(ctrl)
 		ctx := context.Background()
 
 		concurrencyLimiter.EXPECT().Acquire(ctx).Return(true).Times(2)
@@ -76,8 +76,8 @@ func TestLimiterOnActive(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		defer ctrl.Finish()
 
-		concurrencyLimiter := mocks.NewMockConcurrencyLimiter(ctrl)
-		rateLimiter := mocks.NewMockRateLimiter(ctrl)
+		concurrencyLimiter := mockslimiter.NewMockConcurrencyLimiter(ctrl)
+		rateLimiter := mockslimiter.NewMockRateLimiter(ctrl)
 		ctx := context.Background()
 
 		concurrencyLimiter.EXPECT().Acquire(ctx).Return(false).Times(2)
@@ -85,21 +85,21 @@ func TestLimiterOnActive(t *testing.T) {
 		handler := NewServerLimiterHandler(concurrencyLimiter, rateLimiter, nil, false)
 		ctx, err := handler.OnActive(ctx, invoke.NewMessage(nil, nil))
 		test.Assert(t, ctx != nil)
-		test.Assert(t, errors.Is(kerrors.ErrConnOverLimit, err))
+		test.Assert(t, errors.Is(err, kerrors.ErrConnOverLimit))
 
 		muxHandler := NewServerLimiterHandler(concurrencyLimiter, rateLimiter, nil, true)
 		ctx, err = muxHandler.OnActive(ctx, invoke.NewMessage(nil, nil))
 		test.Assert(t, ctx != nil)
-		test.Assert(t, errors.Is(kerrors.ErrConnOverLimit, err))
+		test.Assert(t, errors.Is(err, kerrors.ErrConnOverLimit))
 	})
 
 	t.Run("Test OnActive with limit acquire false and non-nil reporter", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		defer ctrl.Finish()
 
-		concurrencyLimiter := mocks.NewMockConcurrencyLimiter(ctrl)
-		rateLimiter := mocks.NewMockRateLimiter(ctrl)
-		limitReporter := mocks.NewMockLimitReporter(ctrl)
+		concurrencyLimiter := mockslimiter.NewMockConcurrencyLimiter(ctrl)
+		rateLimiter := mockslimiter.NewMockRateLimiter(ctrl)
+		limitReporter := mockslimiter.NewMockLimitReporter(ctrl)
 		ctx := context.Background()
 
 		concurrencyLimiter.EXPECT().Acquire(ctx).Return(false).Times(2)
@@ -109,13 +109,13 @@ func TestLimiterOnActive(t *testing.T) {
 		ctx, err := handler.OnActive(ctx, invoke.NewMessage(nil, nil))
 		test.Assert(t, ctx != nil)
 		test.Assert(t, err != nil)
-		test.Assert(t, errors.Is(kerrors.ErrConnOverLimit, err))
+		test.Assert(t, errors.Is(err, kerrors.ErrConnOverLimit))
 
 		muxHandler := NewServerLimiterHandler(concurrencyLimiter, rateLimiter, limitReporter, true)
 		ctx, err = muxHandler.OnActive(ctx, invoke.NewMessage(nil, nil))
 		test.Assert(t, ctx != nil)
 		test.Assert(t, err != nil)
-		test.Assert(t, errors.Is(kerrors.ErrConnOverLimit, err))
+		test.Assert(t, errors.Is(err, kerrors.ErrConnOverLimit))
 	})
 }
 
@@ -126,9 +126,9 @@ func TestLimiterOnRead(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		defer ctrl.Finish()
 
-		concurrencyLimiter := mocks.NewMockConcurrencyLimiter(ctrl)
-		rateLimiter := mocks.NewMockRateLimiter(ctrl)
-		limitReporter := mocks.NewMockLimitReporter(ctrl)
+		concurrencyLimiter := mockslimiter.NewMockConcurrencyLimiter(ctrl)
+		rateLimiter := mockslimiter.NewMockRateLimiter(ctrl)
+		limitReporter := mockslimiter.NewMockLimitReporter(ctrl)
 		ctx := context.Background()
 
 		rateLimiter.EXPECT().Acquire(ctx).Return(true).Times(1)
@@ -144,8 +144,8 @@ func TestLimiterOnRead(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		defer ctrl.Finish()
 
-		concurrencyLimiter := mocks.NewMockConcurrencyLimiter(ctrl)
-		rateLimiter := mocks.NewMockRateLimiter(ctrl)
+		concurrencyLimiter := mockslimiter.NewMockConcurrencyLimiter(ctrl)
+		rateLimiter := mockslimiter.NewMockRateLimiter(ctrl)
 		ctx := context.Background()
 
 		rateLimiter.EXPECT().Acquire(ctx).Return(false)
@@ -154,16 +154,16 @@ func TestLimiterOnRead(t *testing.T) {
 		ctx, err := handler.OnRead(ctx, invoke.NewMessage(nil, nil))
 
 		test.Assert(t, ctx != nil)
-		test.Assert(t, errors.Is(kerrors.ErrQPSOverLimit, err))
+		test.Assert(t, errors.Is(err, kerrors.ErrQPSOverLimit))
 	})
 
 	t.Run("Test OnRead with limit acquire false and non-nil reporter", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		defer ctrl.Finish()
 
-		concurrencyLimiter := mocks.NewMockConcurrencyLimiter(ctrl)
-		rateLimiter := mocks.NewMockRateLimiter(ctrl)
-		limitReporter := mocks.NewMockLimitReporter(ctrl)
+		concurrencyLimiter := mockslimiter.NewMockConcurrencyLimiter(ctrl)
+		rateLimiter := mockslimiter.NewMockRateLimiter(ctrl)
+		limitReporter := mockslimiter.NewMockLimitReporter(ctrl)
 		ctx := context.Background()
 
 		rateLimiter.EXPECT().Acquire(ctx).Return(false).Times(1)
@@ -174,7 +174,7 @@ func TestLimiterOnRead(t *testing.T) {
 
 		test.Assert(t, ctx != nil)
 		test.Assert(t, err != nil)
-		test.Assert(t, errors.Is(kerrors.ErrQPSOverLimit, err))
+		test.Assert(t, errors.Is(err, kerrors.ErrQPSOverLimit))
 	})
 }
 
@@ -184,9 +184,9 @@ func TestLimiterOnInactive(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		defer ctrl.Finish()
 
-		concurrencyLimiter := mocks.NewMockConcurrencyLimiter(ctrl)
-		rateLimiter := mocks.NewMockRateLimiter(ctrl)
-		limitReporter := mocks.NewMockLimitReporter(ctrl)
+		concurrencyLimiter := mockslimiter.NewMockConcurrencyLimiter(ctrl)
+		rateLimiter := mockslimiter.NewMockRateLimiter(ctrl)
+		limitReporter := mockslimiter.NewMockLimitReporter(ctrl)
 		ctx := context.Background()
 
 		concurrencyLimiter.EXPECT().Release(ctx).Times(2)
@@ -207,9 +207,9 @@ func TestLimiterOnMessage(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		defer ctrl.Finish()
 
-		concurrencyLimiter := mocks.NewMockConcurrencyLimiter(ctrl)
-		rateLimiter := mocks.NewMockRateLimiter(ctrl)
-		limitReporter := mocks.NewMockLimitReporter(ctrl)
+		concurrencyLimiter := mockslimiter.NewMockConcurrencyLimiter(ctrl)
+		rateLimiter := mockslimiter.NewMockRateLimiter(ctrl)
+		limitReporter := mockslimiter.NewMockLimitReporter(ctrl)
 		ctx := context.Background()
 		req := remote.NewMessage(nil, nil, nil, remote.Call, remote.Client)
 
@@ -226,8 +226,8 @@ func TestLimiterOnMessage(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		defer ctrl.Finish()
 
-		concurrencyLimiter := mocks.NewMockConcurrencyLimiter(ctrl)
-		rateLimiter := mocks.NewMockRateLimiter(ctrl)
+		concurrencyLimiter := mockslimiter.NewMockConcurrencyLimiter(ctrl)
+		rateLimiter := mockslimiter.NewMockRateLimiter(ctrl)
 		ctx := context.Background()
 		req := remote.NewMessage(nil, nil, nil, remote.Call, remote.Client)
 
@@ -237,16 +237,16 @@ func TestLimiterOnMessage(t *testing.T) {
 		ctx, err := handler.OnMessage(ctx, req, remote.NewMessage(nil, nil, nil, remote.Reply, remote.Client))
 
 		test.Assert(t, ctx != nil)
-		test.Assert(t, errors.Is(kerrors.ErrQPSOverLimit, err))
+		test.Assert(t, errors.Is(err, kerrors.ErrQPSOverLimit))
 	})
 
 	t.Run("Test OnMessage with limit acquire false and non-nil reporter", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		defer ctrl.Finish()
 
-		concurrencyLimiter := mocks.NewMockConcurrencyLimiter(ctrl)
-		rateLimiter := mocks.NewMockRateLimiter(ctrl)
-		limitReporter := mocks.NewMockLimitReporter(ctrl)
+		concurrencyLimiter := mockslimiter.NewMockConcurrencyLimiter(ctrl)
+		rateLimiter := mockslimiter.NewMockRateLimiter(ctrl)
+		limitReporter := mockslimiter.NewMockLimitReporter(ctrl)
 		ctx := context.Background()
 		req := remote.NewMessage(nil, nil, nil, remote.Call, remote.Client)
 
@@ -258,6 +258,6 @@ func TestLimiterOnMessage(t *testing.T) {
 
 		test.Assert(t, ctx != nil)
 		test.Assert(t, err != nil)
-		test.Assert(t, errors.Is(kerrors.ErrQPSOverLimit, err))
+		test.Assert(t, errors.Is(err, kerrors.ErrQPSOverLimit))
 	})
 }

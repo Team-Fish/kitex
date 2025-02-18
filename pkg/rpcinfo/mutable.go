@@ -20,6 +20,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/cloudwego/kitex/pkg/serviceinfo"
 	"github.com/cloudwego/kitex/pkg/stats"
 	"github.com/cloudwego/kitex/transport"
 )
@@ -31,6 +32,8 @@ type MutableEndpointInfo interface {
 	SetAddress(addr net.Addr) error
 	SetTag(key, value string) error
 	ImmutableView() EndpointInfo
+	Reset()
+	ResetFromBasicInfo(bi *EndpointBasicInfo)
 }
 
 // MutableRPCConfig is used to change the information in the RPCConfig.
@@ -46,7 +49,11 @@ type MutableRPCConfig interface {
 	SetInteractionMode(mode InteractionMode) error
 	LockConfig(bits int)
 	Clone() MutableRPCConfig
+	CopyFrom(from RPCConfig)
 	ImmutableView() RPCConfig
+	SetPayloadCodec(codec serviceinfo.PayloadCodec)
+
+	SetStreamRecvTimeout(timeout time.Duration)
 }
 
 // MutableRPCStats is used to change the information in the RPCStats.
@@ -58,4 +65,6 @@ type MutableRPCStats interface {
 	SetLevel(level stats.Level)
 	Reset()
 	ImmutableView() RPCStats
+	IncrSendSize(size uint64)
+	IncrRecvSize(size uint64)
 }

@@ -25,13 +25,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/golang/mock/gomock"
+
 	"github.com/cloudwego/kitex/internal/mocks"
-	internal_stats "github.com/cloudwego/kitex/internal/stats"
+	mocksremote "github.com/cloudwego/kitex/internal/mocks/remote"
 	"github.com/cloudwego/kitex/internal/test"
 	"github.com/cloudwego/kitex/pkg/remote"
 	"github.com/cloudwego/kitex/pkg/rpcinfo"
 	"github.com/cloudwego/kitex/pkg/utils"
-	"github.com/golang/mock/gomock"
 )
 
 var (
@@ -45,25 +46,29 @@ var (
 )
 
 func TestMain(m *testing.M) {
+	svcInfo := mocks.ServiceInfo()
 	svrOpt = &remote.ServerOption{
-		InitRPCInfoFunc: func(ctx context.Context, addr net.Addr) (rpcinfo.RPCInfo, context.Context) {
+		InitOrResetRPCInfoFunc: func(ri rpcinfo.RPCInfo, addr net.Addr) rpcinfo.RPCInfo {
 			fromInfo := rpcinfo.EmptyEndpointInfo()
 			rpcCfg := rpcinfo.NewRPCConfig()
 			mCfg := rpcinfo.AsMutableRPCConfig(rpcCfg)
 			mCfg.SetReadWriteTimeout(rwTimeout)
 			ink := rpcinfo.NewInvocation("", method)
 			rpcStat := rpcinfo.NewRPCStats()
-			ri := rpcinfo.NewRPCInfo(fromInfo, nil, ink, rpcCfg, rpcStat)
-			rpcinfo.AsMutableEndpointInfo(ri.From()).SetAddress(addr)
-			ctx = rpcinfo.NewCtxWithRPCInfo(ctx, ri)
-			return ri, ctx
+			nri := rpcinfo.NewRPCInfo(fromInfo, nil, ink, rpcCfg, rpcStat)
+			rpcinfo.AsMutableEndpointInfo(nri.From()).SetAddress(addr)
+			return nri
 		},
 		Codec: &MockCodec{
 			EncodeFunc: nil,
-			DecodeFunc: nil,
+			DecodeFunc: func(ctx context.Context, msg remote.Message, in remote.ByteBuffer) error {
+				msg.SpecifyServiceInfo(mocks.MockServiceName, mocks.MockMethod)
+				return nil
+			},
 		},
-		SvcInfo:   mocks.ServiceInfo(),
-		TracerCtl: &internal_stats.Controller{},
+		SvcSearcher:   mocksremote.NewDefaultSvcSearcher(),
+		TargetSvcInfo: svcInfo,
+		TracerCtl:     &rpcinfo.TraceController{},
 	}
 	svrTransHdlr, _ = newSvrTransHandler(svrOpt)
 	transSvr = NewTransServerFactory().NewTransServer(svrOpt, svrTransHdlr).(*transServer)
@@ -74,7 +79,7 @@ func TestMain(m *testing.M) {
 // TestCreateListener test trans_server CreateListener success
 func TestCreateListener(t *testing.T) {
 	// tcp init
-	addrStr := "127.0.0.1:9090"
+	addrStr := "127.0.0.1:9091"
 	addr = utils.NewNetAddr("tcp", addrStr)
 
 	// test
@@ -98,7 +103,7 @@ func TestCreateListener(t *testing.T) {
 // TestBootStrap test trans_server BootstrapServer success
 func TestBootStrap(t *testing.T) {
 	// tcp init
-	addrStr := "127.0.0.1:9090"
+	addrStr := "127.0.0.1:9092"
 	addr = utils.NewNetAddr("tcp", addrStr)
 
 	// test
@@ -109,7 +114,7 @@ func TestBootStrap(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
-		err = transSvr.BootstrapServer()
+		err = transSvr.BootstrapServer(ln)
 		test.Assert(t, err == nil, err)
 		wg.Done()
 	}()
@@ -158,7 +163,7 @@ func TestConnOnActiveAndOnInactivePanic(t *testing.T) {
 		ctrl.Finish()
 	}()
 
-	inboundHandler := mocks.NewMockInboundHandler(ctrl)
+	inboundHandler := mocksremote.NewMockInboundHandler(ctrl)
 	transPl := remote.NewTransPipeline(svrTransHdlr)
 	transPl.AddInboundHandler(inboundHandler)
 	transSvrWithPl := NewTransServerFactory().NewTransServer(svrOpt, transPl).(*transServer)
@@ -185,14 +190,21 @@ func TestConnOnActiveAndOnInactivePanic(t *testing.T) {
 
 // TestOnConnRead test trans_server onConnRead success
 func TestConnOnRead(t *testing.T) {
-	// 1. prepare mock data
+	// prepare mock data
+	var isClosed bool
 	conn := &MockNetpollConn{
 		Conn: mocks.Conn{
 			RemoteAddrFunc: func() (r net.Addr) {
 				return addr
 			},
+			CloseFunc: func() (e error) {
+				isClosed = true
+				return nil
+			},
 		},
 	}
+
+	// case return err
 	mockErr := errors.New("mock error")
 	transSvr.transHdlr = &mocks.MockSvrTransHandler{
 		OnReadFunc: func(ctx context.Context, conn net.Conn) error {
@@ -200,8 +212,18 @@ func TestConnOnRead(t *testing.T) {
 		},
 		Opt: transSvr.opt,
 	}
-
-	// 2. test
 	err := transSvr.onConnRead(context.Background(), conn)
 	test.Assert(t, err == nil, err)
+	test.Assert(t, isClosed)
+
+	// case panic
+	transSvr.transHdlr = &mocks.MockSvrTransHandler{
+		OnReadFunc: func(ctx context.Context, conn net.Conn) error {
+			panic("case panic")
+		},
+		Opt: transSvr.opt,
+	}
+	test.Panic(t, func() {
+		_ = transSvr.onConnRead(context.Background(), conn)
+	})
 }

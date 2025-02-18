@@ -26,25 +26,31 @@ import (
 
 	"github.com/cloudwego/kitex/internal/client"
 	"github.com/cloudwego/kitex/pkg/discovery"
+	"github.com/cloudwego/kitex/pkg/fallback"
 	"github.com/cloudwego/kitex/pkg/http"
+	"github.com/cloudwego/kitex/pkg/retry"
 	"github.com/cloudwego/kitex/pkg/rpcinfo"
 	"github.com/cloudwego/kitex/pkg/rpcinfo/remoteinfo"
-	"github.com/cloudwego/kitex/pkg/utils"
 )
 
 var callOptionsPool = sync.Pool{
 	New: newOptions,
 }
 
-type callOptions struct {
-	configs      rpcinfo.RPCConfig
+type CallOptions struct {
+	configs      rpcinfo.MutableRPCConfig
 	svr          remoteinfo.RemoteInfo
 	locks        *client.ConfigLocks
 	httpResolver http.Resolver
+
+	// export field for using in client
+	RetryPolicy    retry.Policy
+	Fallback       *fallback.Policy
+	CompressorName string
 }
 
 func newOptions() interface{} {
-	return &callOptions{
+	return &CallOptions{
 		locks: &client.ConfigLocks{
 			Tags: make(map[string]struct{}),
 		},
@@ -52,22 +58,40 @@ func newOptions() interface{} {
 }
 
 // Recycle zeros the call option and put it to the pool.
-func (co *callOptions) Recycle() {
+func (co *CallOptions) Recycle() {
+	if co == nil {
+		return
+	}
 	co.configs = nil
 	co.svr = nil
+	co.RetryPolicy = retry.Policy{}
+	co.Fallback = nil
 	co.locks.Zero()
 	callOptionsPool.Put(co)
 }
 
 // Option is a series of options used at the beginning of a RPC call.
 type Option struct {
-	f func(o *callOptions, di *strings.Builder)
+	f func(o *CallOptions, di *strings.Builder)
+}
+
+// F returns the function of the option.
+// It's useful for creating streamcall.Option from existing callopt.Option
+// Note: not all callopt.Option(s) are available for stream clients.
+func (o Option) F() func(o *CallOptions, di *strings.Builder) {
+	return o.f
+}
+
+// NewOption returns a new Option with the given function.
+// It's useful for converting streamcall.Option back to a callopt.Option
+func NewOption(f func(o *CallOptions, di *strings.Builder)) Option {
+	return Option{f: f}
 }
 
 // WithHostPort specifies the target address for a RPC call.
 // The given address will overwrite the result from Resolver.
 func WithHostPort(hostport string) Option {
-	return Option{func(o *callOptions, di *strings.Builder) {
+	return Option{func(o *CallOptions, di *strings.Builder) {
 		di.WriteString("WithHostPort(")
 		di.WriteString(hostport)
 		di.WriteString("),")
@@ -92,7 +116,7 @@ func setInstance(svr remoteinfo.RemoteInfo, hostport string) error {
 // WithURL specifies the target for a RPC call with url.
 // The given url will be resolved to hostport and overwrites the result from Resolver.
 func WithURL(url string) Option {
-	return Option{func(o *callOptions, di *strings.Builder) {
+	return Option{func(o *CallOptions, di *strings.Builder) {
 		di.WriteString("WithURL(")
 		di.WriteString(url)
 		di.WriteString("),")
@@ -111,7 +135,7 @@ func WithURL(url string) Option {
 
 // WithHTTPHost specifies host in http header(work when RPC over http).
 func WithHTTPHost(host string) Option {
-	return Option{func(o *callOptions, di *strings.Builder) {
+	return Option{func(o *CallOptions, di *strings.Builder) {
 		o.svr.SetTag(rpcinfo.HTTPHost, host)
 	}}
 }
@@ -120,37 +144,31 @@ func WithHTTPHost(host string) Option {
 // FIXME: callopt.WithRPCTimeout works only when client.WithRPCTimeout or
 // client.WithTimeoutProvider is specified.
 func WithRPCTimeout(d time.Duration) Option {
-	return Option{func(o *callOptions, di *strings.Builder) {
-		di.WriteString("WithRPCTimeout(")
-		utils.WriteInt64ToStringBuilder(di, d.Milliseconds())
-		di.WriteString("ms)")
+	return Option{func(o *CallOptions, di *strings.Builder) {
+		di.WriteString("WithRPCTimeout()")
 
-		cfg := rpcinfo.AsMutableRPCConfig(o.configs)
-		cfg.SetRPCTimeout(d)
+		o.configs.SetRPCTimeout(d)
 		o.locks.Bits |= rpcinfo.BitRPCTimeout
 
 		// TODO SetReadWriteTimeout 是否考虑删除
-		cfg.SetReadWriteTimeout(d)
+		o.configs.SetReadWriteTimeout(d)
 		o.locks.Bits |= rpcinfo.BitReadWriteTimeout
 	}}
 }
 
 // WithConnectTimeout specifies the connection timeout for a RPC call.
 func WithConnectTimeout(d time.Duration) Option {
-	return Option{func(o *callOptions, di *strings.Builder) {
-		di.WriteString("WithConnectTimeout(")
-		utils.WriteInt64ToStringBuilder(di, d.Milliseconds())
-		di.WriteString("ms)")
+	return Option{func(o *CallOptions, di *strings.Builder) {
+		di.WriteString("WithConnectTimeout()")
 
-		cfg := rpcinfo.AsMutableRPCConfig(o.configs)
-		cfg.SetConnectTimeout(d)
+		o.configs.SetConnectTimeout(d)
 		o.locks.Bits |= rpcinfo.BitConnectTimeout
 	}}
 }
 
 // WithTag sets the tags for service discovery for a RPC call.
 func WithTag(key, val string) Option {
-	return Option{f: func(o *callOptions, di *strings.Builder) {
+	return Option{f: func(o *CallOptions, di *strings.Builder) {
 		di.WriteString("WithTag")
 		di.WriteByte('(')
 		di.WriteString(key)
@@ -163,13 +181,75 @@ func WithTag(key, val string) Option {
 	}}
 }
 
+// WithRetryPolicy sets the retry policy for a RPC call.
+// Build retry.Policy with retry.BuildFailurePolicy or retry.BuildBackupRequest or retry.BuildMixedPolicy
+// instead of building retry.Policy directly.
+//
+// Demos are provided below:
+//
+//	demo1. call with failure retry policy, default retry error is Timeout
+//		`resp, err := cli.Mock(ctx, req, callopt.WithRetryPolicy(retry.BuildFailurePolicy(retry.NewFailurePolicy())))`
+//	demo2. call with backup request policy
+//		`bp := retry.NewBackupPolicy(10)
+//		`bp.WithMaxRetryTimes(1)`
+//		`resp, err := cli.Mock(ctx, req, callopt.WithRetryPolicy(retry.BuildBackupRequest(bp)))`
+//	demo2. call with miexed request policy
+//		`bp := retry.BuildMixedPolicy(10)
+//		`resp, err := cli.Mock(ctx, req, callopt.WithRetryPolicy(retry.BuildMixedPolicy(retry.NewMixedPolicy(10))))`
+func WithRetryPolicy(p retry.Policy) Option {
+	return Option{f: func(o *CallOptions, di *strings.Builder) {
+		if !p.Enable {
+			return
+		}
+		if p.Type == retry.MixedType {
+			di.WriteString("WithMixedRetry")
+		} else if p.Type == retry.BackupType {
+			di.WriteString("WithBackupRequest")
+		} else {
+			di.WriteString("WithFailureRetry")
+		}
+		o.RetryPolicy = p
+	}}
+}
+
+// WithFallback is used to set the fallback policy for a RPC call.
+// Demos are provided below:
+//
+//	demo1. call with fallback for error
+//		`resp, err := cli.Mock(ctx, req, callopt.WithFallback(fallback.ErrorFallback(yourFBFunc))`
+//	demo2. call with fallback for error and enable reportAsFallback, which sets reportAsFallback to be true and will do report(metric) as Fallback result
+//		`resp, err := cli.Mock(ctx, req, callopt.WithFallback(fallback.ErrorFallback(yourFBFunc).EnableReportAsFallback())`
+func WithFallback(fb *fallback.Policy) Option {
+	return Option{f: func(o *CallOptions, di *strings.Builder) {
+		if !fallback.IsPolicyValid(fb) {
+			return
+		}
+		di.WriteString("WithFallback")
+		o.Fallback = fb
+	}}
+}
+
+// WithGRPCCompressor specifies the compressor for the GRPC frame payload.
+// Supported compressor names: identity, gzip
+// Custom compressors can be registered via `encoding.RegisterCompressor`
+func WithGRPCCompressor(compressorName string) Option {
+	return Option{f: func(o *CallOptions, di *strings.Builder) {
+		di.WriteString("WithGRPCCompressor")
+		di.WriteByte('(')
+		di.WriteString(compressorName)
+		di.WriteByte(')')
+		o.CompressorName = compressorName
+	}}
+}
+
 // Apply applies call options to the rpcinfo.RPCConfig and internal.RemoteInfo of kitex client.
 // The return value records the name and arguments of each option.
 // This function is for internal purpose only.
-func Apply(cos []Option, cfg rpcinfo.RPCConfig, svr remoteinfo.RemoteInfo, locks *client.ConfigLocks, httpResolver http.Resolver) string {
+func Apply(cos []Option, cfg rpcinfo.MutableRPCConfig, svr remoteinfo.RemoteInfo, locks *client.ConfigLocks, httpResolver http.Resolver) (string, *CallOptions) {
 	var buf strings.Builder
+	buf.Grow(64)
 
-	co := callOptionsPool.Get().(*callOptions)
+	co := callOptionsPool.Get().(*CallOptions)
 	co.configs = cfg
 	co.svr = svr
 	co.locks.Merge(locks)
@@ -185,6 +265,5 @@ func Apply(cos []Option, cfg rpcinfo.RPCConfig, svr remoteinfo.RemoteInfo, locks
 	buf.WriteByte(']')
 
 	co.locks.ApplyLocks(cfg, svr)
-	co.Recycle()
-	return buf.String()
+	return buf.String(), co
 }

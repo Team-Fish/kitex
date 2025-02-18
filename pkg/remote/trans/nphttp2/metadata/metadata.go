@@ -43,10 +43,11 @@ type MD map[string][]string
 // New creates an MD from a given key-value map.
 //
 // Only the following ASCII characters are allowed in keys:
-//  - digits: 0-9
-//  - uppercase letters: A-Z (normalized to lower)
-//  - lowercase letters: a-z
-//  - special characters: -_.
+//   - digits: 0-9
+//   - uppercase letters: A-Z (normalized to lower)
+//   - lowercase letters: a-z
+//   - special characters: -_.
+//
 // Uppercase letters are automatically converted to lowercase.
 //
 // Keys beginning with "grpc-" are reserved for grpc-internal use only and may
@@ -64,10 +65,11 @@ func New(m map[string]string) MD {
 // Pairs panics if len(kv) is odd.
 //
 // Only the following ASCII characters are allowed in keys:
-//  - digits: 0-9
-//  - uppercase letters: A-Z (normalized to lower)
-//  - lowercase letters: a-z
-//  - special characters: -_.
+//   - digits: 0-9
+//   - uppercase letters: A-Z (normalized to lower)
+//   - lowercase letters: a-z
+//   - special characters: -_.
+//
 // Uppercase letters are automatically converted to lowercase.
 //
 // Keys beginning with "grpc-" are reserved for grpc-internal use only and may
@@ -95,7 +97,13 @@ func (md MD) Len() int {
 
 // Copy returns a copy of md.
 func (md MD) Copy() MD {
-	return Join(md)
+	result := make(MD, len(md))
+	for k, v := range md {
+		values := make([]string, len(v))
+		copy(values, v)
+		result[k] = values
+	}
+	return result
 }
 
 // Get obtains the values for a given key.
@@ -126,13 +134,28 @@ func (md MD) Append(k string, vals ...string) {
 // The order of values for each key is determined by the order in which
 // the mds containing those values are presented to Join.
 func Join(mds ...MD) MD {
-	out := MD{}
+	n := 0
+	for _, md := range mds {
+		n += len(md)
+	}
+	out := make(MD, n)
 	for _, md := range mds {
 		for k, v := range md {
 			out[k] = append(out[k], v...)
 		}
 	}
 	return out
+}
+
+// AppendMD appends other into md, merging values of the same key.
+func AppendMD(md, other MD) MD {
+	if md == nil {
+		md = make(MD, len(other))
+	}
+	for k, v := range other {
+		md[k] = append(md[k], v...)
+	}
+	return md
 }
 
 type (

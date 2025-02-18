@@ -19,19 +19,24 @@ package test
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
+	"reflect"
+	"time"
 
 	"github.com/cloudwego/kitex/client"
 	"github.com/cloudwego/kitex/client/genericclient"
 	kt "github.com/cloudwego/kitex/internal/mocks/thrift"
+	"github.com/cloudwego/kitex/internal/test"
 	"github.com/cloudwego/kitex/pkg/generic"
 	"github.com/cloudwego/kitex/pkg/generic/descriptor"
 	"github.com/cloudwego/kitex/pkg/rpcinfo"
 	"github.com/cloudwego/kitex/pkg/serviceinfo"
 	"github.com/cloudwego/kitex/server"
 	"github.com/cloudwego/kitex/server/genericserver"
+	"github.com/cloudwego/kitex/transport"
 )
 
 var reqMsg = map[string]interface{}{
@@ -46,28 +51,17 @@ var reqMsg = map[string]interface{}{
 	},
 }
 
-var respMsg = map[string]interface{}{
-	"Msg":            "world",
-	"required_field": "required_field",
-}
-
-var respMsgWithExtra = map[string]interface{}{
-	"Msg":            "world",
-	"required_field": "required_field",
-	"extra_field":    "extra_field",
-}
 var errResp = "Test Error"
 
-func newGenericClient(destService string, g generic.Generic, targetIPPort string) genericclient.Client {
-	var opts []client.Option
-	opts = append(opts, client.WithHostPorts(targetIPPort))
+func newGenericClient(destService string, g generic.Generic, targetIPPort string, opts ...client.Option) genericclient.Client {
+	opts = append(opts, client.WithHostPorts(targetIPPort), client.WithTransportProtocol(transport.TTHeader))
 	genericCli, _ := genericclient.NewClient(destService, g, opts...)
 	return genericCli
 }
 
 func newGenericServer(g generic.Generic, addr net.Addr, handler generic.Service) server.Server {
 	var opts []server.Option
-	opts = append(opts, server.WithServiceAddr(addr))
+	opts = append(opts, server.WithServiceAddr(addr), server.WithExitWaitTime(time.Microsecond*10))
 	svr := genericserver.NewServer(handler, g, opts...)
 	go func() {
 		err := svr.Run()
@@ -75,6 +69,7 @@ func newGenericServer(g generic.Generic, addr net.Addr, handler generic.Service)
 			panic(err)
 		}
 	}()
+	test.WaitServerStart(addr.String())
 	return svr
 }
 
@@ -88,7 +83,37 @@ func (g *GenericServiceImpl) GenericCall(ctx context.Context, method string, req
 	fmt.Printf("Method from Ctx: %s\n", rpcinfo.Invocation().MethodName())
 	fmt.Printf("Recv: %v\n", buf)
 	fmt.Printf("Method: %s\n", method)
-	return respMsgWithExtra, nil
+	return buf, nil
+}
+
+type GenericServiceWithBase64Binary struct{}
+
+// GenericCall ...
+func (g *GenericServiceWithBase64Binary) GenericCall(ctx context.Context, method string, request interface{}) (response interface{}, err error) {
+	buf := request.(map[string]interface{})
+	rpcinfo := rpcinfo.GetRPCInfo(ctx)
+	fmt.Printf("Method from Ctx: %s\n", rpcinfo.Invocation().MethodName())
+	fmt.Printf("Recv: %v\n", buf)
+	fmt.Printf("Method: %s\n", method)
+	if buf["BinaryMsg"] != base64.StdEncoding.EncodeToString([]byte("hello")) {
+		return "", fmt.Errorf("BinaryMsg is not %s but %s", base64.StdEncoding.EncodeToString([]byte("hello")), buf["BinaryMsg"])
+	}
+	return buf, nil
+}
+
+type GenericServiceWithByteSliceImpl struct{}
+
+// GenericCall ...
+func (g *GenericServiceWithByteSliceImpl) GenericCall(ctx context.Context, method string, request interface{}) (response interface{}, err error) {
+	buf := request.(map[string]interface{})
+	rpcinfo := rpcinfo.GetRPCInfo(ctx)
+	fmt.Printf("Method from Ctx: %s\n", rpcinfo.Invocation().MethodName())
+	fmt.Printf("Recv: %v\n", buf)
+	fmt.Printf("Method: %s\n", method)
+	if !reflect.DeepEqual(buf["BinaryMsg"], []byte("hello")) {
+		return "", fmt.Errorf("BinaryMsg is not %s but %s", []byte("hello"), buf["BinaryMsg"])
+	}
+	return buf, nil
 }
 
 // GenericServiceErrorImpl ...
@@ -129,18 +154,6 @@ func (g *GenericServiceVoidImpl) GenericCall(ctx context.Context, method string,
 	return descriptor.Void{}, nil
 }
 
-// GenericServiceReadRequiredFiledImpl ...
-type GenericServiceReadRequiredFiledImpl struct{}
-
-// GenericCall ...
-func (g *GenericServiceReadRequiredFiledImpl) GenericCall(ctx context.Context, method string, request interface{}) (response interface{}, err error) {
-	msg := request.(map[string]interface{})
-	fmt.Printf("Recv: %v\n", msg)
-	return map[string]interface{}{
-		"Msg": "world",
-	}, nil
-}
-
 var (
 	mockReq = map[string]interface{}{
 		"Msg": "hello",
@@ -158,7 +171,7 @@ var (
 // normal server
 func newMockServer(handler kt.Mock, addr net.Addr, opts ...server.Option) server.Server {
 	var options []server.Option
-	opts = append(opts, server.WithServiceAddr(addr))
+	opts = append(opts, server.WithServiceAddr(addr), server.WithExitWaitTime(time.Microsecond*10))
 	options = append(options, opts...)
 
 	svr := server.NewServer(options...)
@@ -171,6 +184,7 @@ func newMockServer(handler kt.Mock, addr net.Addr, opts ...server.Option) server
 			panic(err)
 		}
 	}()
+	test.WaitServerStart(addr.String())
 	return svr
 }
 
@@ -234,4 +248,9 @@ func (m *mockImpl) Test(ctx context.Context, req *kt.MockReq) (r string, err err
 		}
 	}
 	return mockResp, nil
+}
+
+// ExceptionTest ...
+func (m *mockImpl) ExceptionTest(ctx context.Context, req *kt.MockReq) (r string, err error) {
+	return "", kt.NewException()
 }

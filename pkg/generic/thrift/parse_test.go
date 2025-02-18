@@ -17,6 +17,7 @@
 package thrift
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
@@ -24,6 +25,7 @@ import (
 
 	"github.com/cloudwego/kitex/internal/test"
 	"github.com/cloudwego/kitex/pkg/generic/descriptor"
+	"github.com/cloudwego/kitex/pkg/serviceinfo"
 )
 
 var httpIDL = `
@@ -95,6 +97,32 @@ func TestParseHttpIDL(t *testing.T) {
 	test.Assert(t, len(bizMethod1.Request.Struct.FieldsByID) == 1)
 	test.Assert(t, bizMethod1.Response.Type == descriptor.STRUCT)
 	test.Assert(t, len(bizMethod1.Response.Struct.FieldsByID) == 2)
+}
+
+var httpConflictPathIDL = `
+namespace go http
+
+struct BizRequest {
+    1: optional i32 api_version(api.path = 'action')
+    2: optional i64 uid(api.path = 'biz')
+}
+
+struct BizResponse {
+    1: optional string T(api.header= 'T')
+}
+
+service BizService{
+BizResponse BizMethod1(1: BizRequest req)(api.post = '/life/client/:action/:biz/*one', api.baseurl = 'ib.snssdk.com', api.param = 'true', api.serializer = 'form')
+BizResponse BizMethod2(1: BizRequest req)(api.post = '/life/client/:action/:biz/*two', api.baseurl = 'ib.snssdk.com', api.param = 'true', api.serializer = 'json')
+BizResponse BizMethod3(1: BizRequest req)(api.post = '/life/client/:action/:biz/*three', api.baseurl = 'ib.snssdk.com', api.param = 'true', api.serializer = 'json')
+}`
+
+func TestPanicRecover(t *testing.T) {
+	re, err := parser.ParseString("http.thrift", httpConflictPathIDL)
+	test.Assert(t, err == nil, err)
+	_, err = Parse(re, LastServiceOnly)
+	test.Assert(t, err != nil)
+	test.DeepEqual(t, err.Error(), "router handle failed, err=handlers are already registered for path '/life/client/:action/:biz/*two'")
 }
 
 var selfReferenceIDL = `
@@ -269,4 +297,231 @@ func TestExtends(t *testing.T) {
 	for _, fn := range []string{"simple", "int2bin", "req2res"} {
 		test.Assert(t, dp.Functions[fn] != nil)
 	}
+}
+
+const defaultValueBaseIDL = `
+namespace * base
+
+enum TestEnum {
+    FIRST = 1,
+    SECOND = 2,
+    THIRD = 3,
+    FOURTH = 4,
+}
+
+struct BaseElem {
+	1: optional i32 a,
+}
+
+const BaseElem defaultBaseElem = {
+	"a": 56
+}
+
+struct BaseStruct {
+    1: optional bool a,
+    2: optional byte b,
+    3: optional i16 c,
+	4: optional i32 d,
+	5: optional i64 e,
+	6: optional double f,
+	7: optional string g,
+	8: optional binary h,
+	9: optional TestEnum i,
+	10: optional set<string> j,
+	11: optional list<BaseElem> k,
+	12: optional map<string, i32> l,
+	13: optional map<i32, BaseElem> m,
+	14: optional BaseElem n,
+}
+
+const set<string> defaultJ = ["123","456"]
+
+const map<string, i32> defaultL = {
+	"123": 12,
+	"456": 45,
+}
+
+const BaseStruct defaultBase = {
+	"a": true,
+	"b": 1,
+	"c": 2,
+	"d": 3,
+	"e": 4,
+	"f": 5.1,
+	"g": "123",
+	"h": "456",
+	"i": TestEnum.THIRD,
+	"j": defaultJ,
+	"k": [{"a": 34}, defaultBaseElem],
+	"l": defaultL,
+	"m": {
+		12: {
+			"a": 34,
+		},
+	},
+	"n": {
+		"a": 56,
+	},
+}
+`
+
+const defaultValueDemoIDL = `
+namespace * demo
+
+include "base.thrift"
+
+const byte DefaultB = 1
+const i16 DefaultC = 2
+const i32 DefaultD = 3
+const i64 DefaultE = 4
+
+struct Request {
+	1: optional bool a = true,
+	2: optional byte b = DefaultB,
+	3: optional i16 c = DefaultC,
+	4: optional i32 d = DefaultD,
+	5: optional i64 e = DefaultE,
+	6: optional double f = 5.1,
+	7: optional string g = "123",
+	8: optional binary h = "456",
+	9: optional base.TestEnum i = base.TestEnum.THIRD,
+	10: optional set<string> j = base.defaultJ,
+	11: optional list<base.BaseElem> k = [{"a": 34}, base.defaultBaseElem],
+	12: optional map<string, i32> l = base.defaultL,
+	13: optional map<i32, base.BaseElem> m = {
+		12: {
+			"a": 34,
+		},
+	},
+	14: optional base.BaseElem n = {
+		"a": 56,
+	},
+	15: optional base.BaseStruct base = base.defaultBase,
+	16: optional list<base.BaseStruct> bases = [base.defaultBase],
+}
+
+struct Response {
+}
+
+service DemoService {
+    Response req2res(1: Request req);
+}
+`
+
+const streamingIDL = `
+namespace go echo
+
+struct Request {
+    1: optional string message,
+}
+
+struct Response {
+    1: optional string message,
+}
+
+service TestService {
+    Response EchoBidirectional (1: Request req) (streaming.mode="bidirectional"),
+    Response EchoClient (1: Request req) (streaming.mode="client"),
+    Response EchoServer (1: Request req) (streaming.mode="server"),
+	Response EchoUnary (1: Request req) (streaming.mode="unary"),
+}
+`
+
+func TestDefaultValue(t *testing.T) {
+	demo, err := parser.ParseString("demo.thrift", defaultValueDemoIDL)
+	test.Assert(t, err == nil)
+
+	base, err := parser.ParseString("base.thrift", defaultValueBaseIDL)
+	test.Assert(t, err == nil)
+
+	demo.Includes[0].Reference = base
+
+	dp, err := Parse(demo, DefaultParseMode())
+	test.Assert(t, err == nil, err)
+
+	fun, err := dp.LookupFunctionByMethod("req2res")
+	test.Assert(t, err == nil)
+
+	defaultValueDeepEqual(t, func(name string) interface{} {
+		return fun.Request.Struct.FieldsByName["req"].Type.Struct.FieldsByName[name].DefaultValue
+	})
+
+	defaultBase := fun.Request.Struct.FieldsByName["req"].Type.Struct.FieldsByName["base"].DefaultValue.(map[string]interface{})
+	defaultValueDeepEqual(t, func(name string) interface{} {
+		return defaultBase[name]
+	})
+
+	defaultBases := fun.Request.Struct.FieldsByName["req"].Type.Struct.FieldsByName["bases"].DefaultValue.([]interface{})
+	for i := range defaultBases {
+		defaultBase := defaultBases[i].(map[string]interface{})
+		defaultValueDeepEqual(t, func(name string) interface{} {
+			return defaultBase[name]
+		})
+	}
+}
+
+func TestStreamingMode(t *testing.T) {
+	streaming, err := parser.ParseString("streaming.thrift", streamingIDL)
+	test.Assert(t, err == nil)
+
+	dp, err := Parse(streaming, DefaultParseMode())
+	test.Assert(t, err == nil)
+
+	method, err := dp.LookupFunctionByMethod("EchoBidirectional")
+	test.Assert(t, err == nil)
+	test.Assert(t, method.StreamingMode == serviceinfo.StreamingBidirectional)
+
+	method, err = dp.LookupFunctionByMethod("EchoClient")
+	test.Assert(t, err == nil)
+	test.Assert(t, method.StreamingMode == serviceinfo.StreamingClient)
+
+	method, err = dp.LookupFunctionByMethod("EchoServer")
+	test.Assert(t, err == nil)
+	test.Assert(t, method.StreamingMode == serviceinfo.StreamingServer)
+
+	method, err = dp.LookupFunctionByMethod("EchoUnary")
+	test.Assert(t, err == nil)
+	test.Assert(t, method.StreamingMode == serviceinfo.StreamingUnary)
+}
+
+func defaultValueDeepEqual(t *testing.T, defaultValue func(name string) interface{}) {
+	test.Assert(t, defaultValue("a") == true)
+	test.Assert(t, defaultValue("b") == byte(1))
+	test.Assert(t, defaultValue("c") == int16(2))
+	test.Assert(t, defaultValue("d") == int32(3))
+	test.Assert(t, defaultValue("e") == int64(4))
+	test.Assert(t, defaultValue("f") == 5.1)
+	test.Assert(t, defaultValue("g") == "123")
+	test.Assert(t, reflect.DeepEqual(defaultValue("h"), []byte("456")))
+	test.Assert(t, defaultValue("i") == int64(3))
+	test.Assert(t, reflect.DeepEqual(defaultValue("j"), []interface{}{"123", "456"}))
+	test.Assert(t, reflect.DeepEqual(defaultValue("k"), []interface{}{
+		map[string]interface{}{"a": int32(34)},
+		map[string]interface{}{"a": int32(56)},
+	}))
+	test.Assert(t, reflect.DeepEqual(defaultValue("l"), map[interface{}]interface{}{
+		"123": int32(12),
+		"456": int32(45),
+	}))
+	test.Assert(t, reflect.DeepEqual(defaultValue("m"), map[interface{}]interface{}{
+		int32(12): map[string]interface{}{"a": int32(34)},
+	}))
+	test.Assert(t, reflect.DeepEqual(defaultValue("n"), map[string]interface{}{
+		"a": int32(56),
+	}))
+}
+
+func TestParseWithIDLServiceName(t *testing.T) {
+	demo, err := parser.ParseString("demo.thrift", demoIDL)
+	test.Assert(t, err == nil)
+
+	base, err := parser.ParseString("base.thrift", baseIDL)
+	test.Assert(t, err == nil)
+
+	demo.Includes[0].Reference = base
+
+	sDsc, err := Parse(demo, LastServiceOnly, WithIDLServiceName("DemoBaseService"))
+	test.Assert(t, err == nil)
+	// priority: service name specification > parse mode
+	test.Assert(t, sDsc.Name == "DemoBaseService")
 }

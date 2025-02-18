@@ -20,6 +20,10 @@ package descriptor
 import (
 	"fmt"
 	"os"
+
+	dthrift "github.com/cloudwego/dynamicgo/thrift"
+
+	"github.com/cloudwego/kitex/pkg/serviceinfo"
 )
 
 var isGoTagAliasDisabled = os.Getenv("KITEX_GENERIC_GOTAG_ALIAS_DISABLED") == "True"
@@ -30,15 +34,27 @@ type FieldDescriptor struct {
 	Alias        string // alias name
 	ID           int32
 	Required     bool
+	Optional     bool
+	DefaultValue interface{}
 	IsException  bool
 	Type         *TypeDescriptor
 	HTTPMapping  HTTPMapping
 	ValueMapping ValueMapping
+	GoTagOpt     *GoTagOption
+}
+
+type GoTagOption struct {
+	IsGoAliasDisabled bool
 }
 
 // FieldName return field name maybe with an alias
 func (d *FieldDescriptor) FieldName() string {
-	if d.Alias != "" && !isGoTagAliasDisabled {
+	aliasDisabled := isGoTagAliasDisabled
+	if d.GoTagOpt != nil {
+		aliasDisabled = d.GoTagOpt.IsGoAliasDisabled
+	}
+
+	if d.Alias != "" && !aliasDisabled {
 		return d.Alias
 	}
 	return d.Name
@@ -60,6 +76,7 @@ type StructDescriptor struct {
 	FieldsByID     map[int32]*FieldDescriptor
 	FieldsByName   map[string]*FieldDescriptor
 	RequiredFields map[int32]*FieldDescriptor
+	DefaultFields  map[string]*FieldDescriptor
 }
 
 // CheckRequired check all required fields at the end of read or write
@@ -74,18 +91,22 @@ func (d *StructDescriptor) CheckRequired(rw map[int32]struct{}) error {
 
 // FunctionDescriptor idl function descriptor
 type FunctionDescriptor struct {
-	Name           string
-	Oneway         bool
-	Request        *TypeDescriptor
-	Response       *TypeDescriptor
-	HasRequestBase bool
+	Name              string
+	Oneway            bool
+	Request           *TypeDescriptor
+	Response          *TypeDescriptor
+	HasRequestBase    bool
+	IsWithoutWrapping bool // true when it's a streaming method. this indicates whether the Request and Response are not wrapped in struct
+	StreamingMode     serviceinfo.StreamingMode
 }
 
 // ServiceDescriptor idl service descriptor
 type ServiceDescriptor struct {
-	Name      string
-	Functions map[string]*FunctionDescriptor
-	Router    Router
+	Name               string
+	Functions          map[string]*FunctionDescriptor
+	Router             Router
+	DynamicGoDsc       *dthrift.ServiceDescriptor
+	IsCombinedServices bool
 }
 
 // LookupFunctionByMethod lookup function by method

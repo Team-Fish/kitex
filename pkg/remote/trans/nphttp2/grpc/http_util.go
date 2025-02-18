@@ -21,26 +21,27 @@
 package grpc
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/base64"
 	"fmt"
-	"io"
 	"math"
-	"net"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 
-	"github.com/cloudwego/kitex/pkg/klog"
-	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/codes"
-	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/status"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 	spb "google.golang.org/genproto/googleapis/rpc/status"
 	"google.golang.org/protobuf/proto"
+
+	"github.com/cloudwego/kitex/pkg/kerrors"
+	"github.com/cloudwego/kitex/pkg/klog"
+	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/codes"
+	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/grpc/grpcframe"
+	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/status"
+	"github.com/cloudwego/kitex/pkg/utils"
 )
 
 const (
@@ -76,6 +77,7 @@ var (
 		http2.ErrCodeEnhanceYourCalm:    codes.ResourceExhausted,
 		http2.ErrCodeInadequateSecurity: codes.PermissionDenied,
 		http2.ErrCodeHTTP11Required:     codes.Internal,
+		gracefulShutdownCode:            codes.Unavailable,
 	}
 	statusCodeConvTab = map[codes.Code]http2.ErrCode{
 		codes.Internal:          http2.ErrCodeInternal,
@@ -106,16 +108,20 @@ var (
 )
 
 type parsedHeaderData struct {
-	encoding string
+	encoding       string
+	acceptEncoding string
 	// statusGen caches the stream status received from the trailer the server
 	// sent.  Client side only.  Do not access directly.  After all trailers are
 	// parsed, use the status method to retrieve the status.
-	statusGen *status.Status
+	statusGen    *status.Status
+	bizStatusErr kerrors.BizStatusErrorIface
 	// rawStatusCode and rawStatusMsg are set from the raw trailer fields and are not
 	// intended for direct access outside of parsing.
-	rawStatusCode *int
-	rawStatusMsg  string
-	httpStatus    *int
+	rawStatusCode  *int
+	rawStatusMsg   string
+	bizStatusCode  *int
+	bizStatusExtra map[string]string
+	httpStatus     *int
 	// Server side only fields.
 	timeoutSet bool
 	timeout    time.Duration
@@ -236,6 +242,17 @@ func (d *decodeState) status() *status.Status {
 	return d.data.statusGen
 }
 
+func (d *decodeState) bizStatusErr() kerrors.BizStatusErrorIface {
+	if d.data.bizStatusErr == nil && d.data.bizStatusCode != nil {
+		d.data.bizStatusErr = kerrors.NewGRPCBizStatusErrorWithExtra(
+			safeCastInt32(*(d.data.bizStatusCode)), d.data.rawStatusMsg, d.data.bizStatusExtra)
+		if st, ok := d.data.bizStatusErr.(kerrors.GRPCStatusIface); ok {
+			st.SetGRPCStatus(d.status())
+		}
+	}
+	return d.data.bizStatusErr
+}
+
 // safeCastInt32 casts the number from int to int32 in safety.
 func safeCastInt32(n int) int32 {
 	if n > math.MaxInt32 || n < math.MinInt32 {
@@ -273,7 +290,7 @@ func decodeMetadataHeader(k, v string) (string, error) {
 	return v, nil
 }
 
-func (d *decodeState) decodeHeader(frame *http2.MetaHeadersFrame) error {
+func (d *decodeState) decodeHeader(frame *grpcframe.MetaHeadersFrame) error {
 	// frame.Truncated is set to true when framer detects that the current header
 	// list size hits MaxHeaderListSize limit.
 	if frame.Truncated {
@@ -368,6 +385,8 @@ func (d *decodeState) processHeaderField(f hpack.HeaderField) {
 		d.data.isGRPC = true
 	case "grpc-encoding":
 		d.data.encoding = f.Value
+	case "grpc-accept-encoding":
+		d.data.acceptEncoding = f.Value
 	case "grpc-status":
 		code, err := strconv.Atoi(f.Value)
 		if err != nil {
@@ -377,6 +396,20 @@ func (d *decodeState) processHeaderField(f hpack.HeaderField) {
 		d.data.rawStatusCode = &code
 	case "grpc-message":
 		d.data.rawStatusMsg = decodeGrpcMessage(f.Value)
+	case "biz-status":
+		code, err := strconv.Atoi(f.Value)
+		if err != nil {
+			d.data.grpcErr = status.Errorf(codes.Internal, "transport: malformed biz-status: %v", err)
+			return
+		}
+		d.data.bizStatusCode = &code
+	case "biz-extra":
+		extra, err := utils.JSONStr2Map(f.Value)
+		if err != nil {
+			d.data.grpcErr = status.Errorf(codes.Internal, "transport: malformed biz-extra: %v", err)
+			return
+		}
+		d.data.bizStatusExtra = extra
 	case "grpc-status-details-bin":
 		v, err := decodeBinHeader(f.Value)
 		if err != nil {
@@ -609,82 +642,4 @@ func decodeGrpcMessageUnchecked(msg string) string {
 		}
 	}
 	return buf.String()
-}
-
-type framer struct {
-	*http2.Framer
-	writer *bufWriter
-}
-
-func newFramer(conn net.Conn, writeBufferSize, readBufferSize, maxHeaderListSize uint32) *framer {
-	w := newBufWriter(conn, int(writeBufferSize))
-
-	var r io.Reader = conn
-	if readBufferSize > 0 {
-		r = bufio.NewReaderSize(r, int(readBufferSize))
-	}
-
-	fr := &framer{
-		writer: w,
-		Framer: http2.NewFramer(w, r),
-	}
-	fr.SetMaxReadFrameSize(http2MaxFrameLen)
-	// Opt-in to Frame reuse API on framer to reduce garbage.
-	// Frames aren't safe to read from after a subsequent call to ReadFrame.
-	fr.SetReuseFrames()
-	fr.MaxHeaderListSize = maxHeaderListSize
-	fr.ReadMetaHeaders = hpack.NewDecoder(http2InitHeaderTableSize, nil)
-	return fr
-}
-
-type bufWriter struct {
-	buf       []byte
-	offset    int
-	batchSize int
-	conn      net.Conn
-	err       error
-
-	onFlush func()
-}
-
-func newBufWriter(conn net.Conn, batchSize int) *bufWriter {
-	return &bufWriter{
-		buf:       make([]byte, batchSize*2),
-		batchSize: batchSize,
-		conn:      conn,
-	}
-}
-
-func (w *bufWriter) Write(b []byte) (n int, err error) {
-	if w.err != nil {
-		return 0, w.err
-	}
-	if w.batchSize == 0 { // buffer has been disabled.
-		return w.conn.Write(b)
-	}
-	for len(b) > 0 {
-		nn := copy(w.buf[w.offset:], b)
-		b = b[nn:]
-		w.offset += nn
-		n += nn
-		if w.offset >= w.batchSize {
-			err = w.Flush()
-		}
-	}
-	return n, err
-}
-
-func (w *bufWriter) Flush() error {
-	if w.err != nil {
-		return w.err
-	}
-	if w.offset == 0 {
-		return nil
-	}
-	if w.onFlush != nil {
-		w.onFlush()
-	}
-	_, w.err = w.conn.Write(w.buf[:w.offset])
-	w.offset = 0
-	return w.err
 }
