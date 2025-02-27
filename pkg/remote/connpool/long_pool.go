@@ -19,9 +19,10 @@ package connpool
 
 import (
 	"context"
+	"fmt"
 	"net"
-	"reflect"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cloudwego/kitex/pkg/connpool"
@@ -33,7 +34,27 @@ import (
 var (
 	_ net.Conn            = &longConn{}
 	_ remote.LongConnPool = &LongPool{}
+
+	// global shared tickers for different LongPool
+	sharedTickers sync.Map
 )
+
+const (
+	configDumpKey = "idle_config"
+)
+
+func getSharedTicker(p *LongPool, refreshInterval time.Duration) *utils.SharedTicker {
+	sti, ok := sharedTickers.Load(refreshInterval)
+	if ok {
+		st := sti.(*utils.SharedTicker)
+		st.Add(p)
+		return st
+	}
+	sti, _ = sharedTickers.LoadOrStore(refreshInterval, utils.NewSharedTicker(refreshInterval))
+	st := sti.(*utils.SharedTicker)
+	st.Add(p)
+	return st
+}
 
 // netAddr implements the net.Addr interface and comparability.
 type netAddr struct {
@@ -57,7 +78,7 @@ type longConn struct {
 
 // Close implements the net.Conn interface.
 func (c *longConn) Close() error {
-	return nil
+	return c.Conn.Close()
 }
 
 // RawConn returns the real underlying net.Conn.
@@ -68,110 +89,246 @@ func (c *longConn) RawConn() net.Conn {
 // IsActive indicates whether the connection is active.
 func (c *longConn) IsActive() bool {
 	if conn, ok := c.Conn.(remote.IsActive); ok {
-		if !conn.IsActive() {
-			return false
-		}
+		return conn.IsActive()
+	} else {
+		return time.Now().Before(c.deadline)
 	}
-	return time.Now().Before(c.deadline)
 }
 
-// Peer has one address, it manage all connections base on this address
-type peer struct {
-	serviceName    string
-	addr           net.Addr
-	ring           *utils.Ring
-	globalIdle     *utils.MaxCounter
-	maxIdleTimeout time.Duration
+// Expired checks the deadline of the connection.
+func (c *longConn) Expired() bool {
+	return time.Now().After(c.deadline)
+}
+
+type PoolDump struct {
+	IdleNum       int         `json:"idle_num"`
+	ConnsDeadline []time.Time `json:"conns_deadline"`
+}
+
+func newPool(minIdle, maxIdle int, maxIdleTimeout time.Duration) *pool {
+	p := &pool{
+		idleList:       make([]*longConn, 0, maxIdle),
+		minIdle:        minIdle,
+		maxIdle:        maxIdle,
+		maxIdleTimeout: maxIdleTimeout,
+	}
+	return p
+}
+
+// pool implements a pool of long connections.
+type pool struct {
+	idleList []*longConn // idleList Get/Put by FILO(stack) but Evict by FIFO(queue)
+	mu       sync.RWMutex
+	// config
+	minIdle        int
+	maxIdle        int           // currIdle <= maxIdle.
+	maxIdleTimeout time.Duration // the idle connection will be cleaned if the idle time exceeds maxIdleTimeout.
+}
+
+// Get gets the first active connection from the idleList. Return the number of connections decreased during the Get.
+func (p *pool) Get() (*longConn, bool, int) {
+	p.mu.Lock()
+	// Get the first active one
+	n := len(p.idleList)
+	selected := n - 1
+	for ; selected >= 0; selected-- {
+		o := p.idleList[selected]
+		// reset slice element to nil, active conn object only could be hold reference by user function
+		p.idleList[selected] = nil
+		if o.IsActive() {
+			p.idleList = p.idleList[:selected]
+			p.mu.Unlock()
+			return o, true, n - selected
+		}
+		// inactive object
+		o.Close()
+	}
+	// in case all objects are inactive
+	if selected < 0 {
+		selected = 0
+	}
+	p.idleList = p.idleList[:selected]
+	p.mu.Unlock()
+	return nil, false, n - selected
+}
+
+// Put puts back a connection to the pool.
+func (p *pool) Put(o *longConn) bool {
+	p.mu.Lock()
+	var recycled bool
+	if len(p.idleList) < p.maxIdle {
+		o.deadline = time.Now().Add(p.maxIdleTimeout)
+		p.idleList = append(p.idleList, o)
+		recycled = true
+	}
+	p.mu.Unlock()
+	return recycled
+}
+
+// Evict cleanups the expired connections.
+// Evict returns how many connections has been evicted.
+func (p *pool) Evict() (evicted int) {
+	p.mu.Lock()
+	nonIdle := len(p.idleList) - p.minIdle
+	// clear non idle connections
+	for ; evicted < nonIdle; evicted++ {
+		if !p.idleList[evicted].Expired() {
+			break
+		}
+		// close the inactive object
+		p.idleList[evicted].Close()
+		// reset slice element to nil, otherwise it will cause the connections will never be destroyed
+		// TODO: use clear(unused_slice) when we no need to care about < go1.18
+		p.idleList[evicted] = nil
+	}
+	p.idleList = p.idleList[evicted:]
+	p.mu.Unlock()
+	return evicted
+}
+
+// Len returns the length of the pool.
+func (p *pool) Len() int {
+	p.mu.RLock()
+	l := len(p.idleList)
+	p.mu.RUnlock()
+	return l
+}
+
+// Close closes the pool and all the objects in the pool.
+func (p *pool) Close() int {
+	p.mu.Lock()
+	num := len(p.idleList)
+	for i := 0; i < num; i++ {
+		p.idleList[i].Close()
+	}
+	p.idleList = nil
+
+	p.mu.Unlock()
+	return num
+}
+
+// Dump dumps the info of all the objects in the pool.
+func (p *pool) Dump() PoolDump {
+	p.mu.RLock()
+	idleNum := len(p.idleList)
+	connsDeadline := make([]time.Time, idleNum)
+	for i := 0; i < idleNum; i++ {
+		connsDeadline[i] = p.idleList[i].deadline
+	}
+	s := PoolDump{
+		IdleNum:       idleNum,
+		ConnsDeadline: connsDeadline,
+	}
+	p.mu.RUnlock()
+	return s
 }
 
 func newPeer(
 	serviceName string,
 	addr net.Addr,
+	minIdle int,
 	maxIdle int,
 	maxIdleTimeout time.Duration,
 	globalIdle *utils.MaxCounter,
 ) *peer {
 	return &peer{
-		serviceName:    serviceName,
-		addr:           addr,
-		ring:           utils.NewRing(maxIdle),
-		globalIdle:     globalIdle,
-		maxIdleTimeout: maxIdleTimeout,
+		serviceName: serviceName,
+		addr:        addr,
+		globalIdle:  globalIdle,
+		pool:        newPool(minIdle, maxIdle, maxIdleTimeout),
 	}
 }
 
-// Reset resets the peer to addr.
-func (p *peer) Reset(addr net.Addr) {
-	p.addr = addr
-	p.Close()
+// peer has one address, it manages all connections base on this address
+type peer struct {
+	// info
+	serviceName string
+	addr        net.Addr
+	globalIdle  *utils.MaxCounter
+	// pool
+	pool *pool
 }
 
-// Get picks up connection from ring or dial a new one.
+// Get gets a connection with dialer and timeout. Dial a new connection if no idle connection in pool is available.
 func (p *peer) Get(d remote.Dialer, timeout time.Duration, reporter Reporter, addr string) (net.Conn, error) {
-	for {
-		conn, _ := p.ring.Pop().(*longConn)
-		if conn == nil {
-			break
-		}
-		p.globalIdle.Dec()
-		if conn.IsActive() {
-			reporter.ReuseSucceed(Long, p.serviceName, p.addr)
-			return conn, nil
-		}
-		_ = conn.Conn.Close()
+	var c net.Conn
+	c, reused, decNum := p.pool.Get()
+	p.globalIdle.DecN(int64(decNum))
+	if reused {
+		reporter.ReuseSucceed(Long, p.serviceName, p.addr)
+		return c, nil
 	}
-	conn, err := d.DialTimeout(p.addr.Network(), p.addr.String(), timeout)
+	// dial a new connection
+	c, err := d.DialTimeout(p.addr.Network(), p.addr.String(), timeout)
 	if err != nil {
 		reporter.ConnFailed(Long, p.serviceName, p.addr)
 		return nil, err
 	}
 	reporter.ConnSucceed(Long, p.serviceName, p.addr)
 	return &longConn{
-		Conn:     conn,
-		deadline: time.Now().Add(p.maxIdleTimeout),
-		address:  addr,
+		Conn:    c,
+		address: addr,
 	}, nil
 }
 
-func (p *peer) put(c *longConn) error {
+// Put puts a connection back to the peer.
+func (p *peer) Put(c *longConn) error {
 	if !p.globalIdle.Inc() {
-		return c.Conn.Close()
+		return c.Close()
 	}
-	c.deadline = time.Now().Add(p.maxIdleTimeout)
-	err := p.ring.Push(c)
-	if err != nil {
+	if !p.pool.Put(c) {
 		p.globalIdle.Dec()
-		return c.Conn.Close()
+		return c.Close()
 	}
 	return nil
 }
 
+func (p *peer) Len() int {
+	return p.pool.Len()
+}
+
+func (p *peer) Evict() {
+	n := p.pool.Evict()
+	p.globalIdle.DecN(int64(n))
+}
+
 // Close closes the peer and all the connections in the ring.
 func (p *peer) Close() {
-	for {
-		conn, _ := p.ring.Pop().(*longConn)
-		if conn == nil {
-			break
-		}
-		p.globalIdle.Dec()
-		_ = conn.Conn.Close()
+	n := p.pool.Close()
+	p.globalIdle.DecN(int64(n))
+}
+
+// NewLongPool creates a long pool using the given IdleConfig.
+func NewLongPool(serviceName string, idlConfig connpool.IdleConfig) *LongPool {
+	limit := utils.NewMaxCounter(idlConfig.MaxIdleGlobal)
+	lp := &LongPool{
+		reporter:   &DummyReporter{},
+		globalIdle: limit,
+		newPeer: func(addr net.Addr) *peer {
+			return newPeer(
+				serviceName,
+				addr,
+				idlConfig.MinIdlePerAddress,
+				idlConfig.MaxIdlePerAddress,
+				idlConfig.MaxIdleTimeout,
+				limit)
+		},
+		idleConfig: idlConfig,
 	}
+	// add this long pool into the sharedTicker
+	lp.sharedTicker = getSharedTicker(lp, idlConfig.MaxIdleTimeout)
+	return lp
 }
 
 // LongPool manages a pool of long connections.
 type LongPool struct {
-	reporter Reporter
-	peerMap  sync.Map
-	newPeer  func(net.Addr) *peer
-}
-
-func (lp *LongPool) getPeer(addr netAddr) *peer {
-	p, ok := lp.peerMap.Load(addr)
-	if ok {
-		return p.(*peer)
-	}
-	p, _ = lp.peerMap.LoadOrStore(addr, lp.newPeer(addr))
-	return p.(*peer)
+	reporter     Reporter
+	peerMap      sync.Map
+	newPeer      func(net.Addr) *peer
+	globalIdle   *utils.MaxCounter
+	idleConfig   connpool.IdleConfig
+	sharedTicker *utils.SharedTicker
+	closed       int32 // active: 0, closed: 1
 }
 
 // Get pick or generate a net.Conn and return
@@ -193,7 +350,7 @@ func (lp *LongPool) Put(conn net.Conn) error {
 	na := netAddr{addr.Network(), c.address}
 	p, ok := lp.peerMap.Load(na)
 	if ok {
-		p.(*peer).put(c)
+		p.(*peer).Put(c)
 		return nil
 	}
 	return c.Conn.Close()
@@ -203,7 +360,7 @@ func (lp *LongPool) Put(conn net.Conn) error {
 func (lp *LongPool) Discard(conn net.Conn) error {
 	c, ok := conn.(*longConn)
 	if ok {
-		return c.Conn.Close()
+		return c.Close()
 	}
 	return conn.Close()
 }
@@ -220,12 +377,9 @@ func (lp *LongPool) Clean(network, address string) {
 // Dump is used to dump current long pool info when needed, like debug query.
 func (lp *LongPool) Dump() interface{} {
 	m := make(map[string]interface{})
+	m[configDumpKey] = lp.idleConfig
 	lp.peerMap.Range(func(key, value interface{}) bool {
-		t := value.(*peer).ring.Dump()
-		arr := reflect.ValueOf(t).Elem().FieldByName("Array").Interface().([]interface{})
-		for i := range arr {
-			arr[i] = arr[i].(*longConn).deadline
-		}
+		t := value.(*peer).pool.Dump()
 		m[key.(netAddr).String()] = t
 		return true
 	})
@@ -234,12 +388,18 @@ func (lp *LongPool) Dump() interface{} {
 
 // Close releases all peers in the pool, it is executed when client is closed.
 func (lp *LongPool) Close() error {
+	if !atomic.CompareAndSwapInt32(&lp.closed, 0, 1) {
+		return fmt.Errorf("long pool is already closed")
+	}
+	// close all peers
 	lp.peerMap.Range(func(addr, value interface{}) bool {
 		lp.peerMap.Delete(addr)
 		v := value.(*peer)
 		v.Close()
 		return true
 	})
+	// remove from the shared ticker
+	lp.sharedTicker.Delete(lp)
 	return nil
 }
 
@@ -254,18 +414,29 @@ func (lp *LongPool) WarmUp(eh warmup.ErrorHandling, wuo *warmup.PoolOption, co r
 	return h.WarmUp(wuo, lp, co)
 }
 
-// NewLongPool creates a long pool using the given IdleConfig.
-func NewLongPool(serviceName string, idlConfig connpool.IdleConfig) *LongPool {
-	limit := utils.NewMaxCounter(idlConfig.MaxIdleGlobal)
-	return &LongPool{
-		reporter: &DummyReporter{},
-		newPeer: func(addr net.Addr) *peer {
-			return newPeer(
-				serviceName,
-				addr,
-				idlConfig.MaxIdlePerAddress,
-				idlConfig.MaxIdleTimeout,
-				limit)
-		},
+// Evict cleanups the idle connections in peers.
+func (lp *LongPool) Evict() {
+	if atomic.LoadInt32(&lp.closed) == 0 {
+		// Evict idle connections
+		lp.peerMap.Range(func(key, value interface{}) bool {
+			p := value.(*peer)
+			p.Evict()
+			return true
+		})
 	}
+}
+
+// Tick implements the interface utils.TickerTask.
+func (lp *LongPool) Tick() {
+	lp.Evict()
+}
+
+// getPeer gets a peer from the pool based on the addr, or create a new one if not exist.
+func (lp *LongPool) getPeer(addr netAddr) *peer {
+	p, ok := lp.peerMap.Load(addr)
+	if ok {
+		return p.(*peer)
+	}
+	p, _ = lp.peerMap.LoadOrStore(addr, lp.newPeer(addr))
+	return p.(*peer)
 }

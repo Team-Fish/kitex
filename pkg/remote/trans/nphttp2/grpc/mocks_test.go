@@ -20,8 +20,9 @@ import (
 	"net"
 	"time"
 
-	"github.com/cloudwego/kitex/pkg/utils"
 	"github.com/cloudwego/netpoll"
+
+	"github.com/cloudwego/kitex/pkg/utils"
 )
 
 var mockAddr0 = "127.0.0.1:33452"
@@ -44,17 +45,13 @@ var _ netpoll.Connection = &mockNetpollConn{}
 // mockNetpollConn implements netpoll.Connection.
 type mockNetpollConn struct {
 	mockConn
-	ReaderFunc func() (r netpoll.Reader)
-	WriterFunc func() (r netpoll.Writer)
 }
 
 func (m *mockNetpollConn) Reader() netpoll.Reader {
-	// TODO implement me
 	panic("implement me")
 }
 
 func (m *mockNetpollConn) Writer() netpoll.Writer {
-	// TODO implement me
 	panic("implement me")
 }
 
@@ -63,6 +60,10 @@ func (m *mockNetpollConn) IsActive() bool {
 }
 
 func (m *mockNetpollConn) SetReadTimeout(timeout time.Duration) error {
+	return nil
+}
+
+func (m *mockNetpollConn) SetWriteTimeout(timeout time.Duration) error {
 	return nil
 }
 
@@ -82,7 +83,7 @@ func (m *mockNetpollConn) WriteFrame(hdr, data []byte) (n int, err error) {
 	return
 }
 
-func (c *mockNetpollConn) ReadFrame() (hdr, data []byte, err error) {
+func (m *mockNetpollConn) ReadFrame() (hdr, data []byte, err error) {
 	return
 }
 

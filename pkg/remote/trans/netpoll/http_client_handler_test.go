@@ -17,18 +17,21 @@
 package netpoll
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/cloudwego/netpoll"
+
 	"github.com/cloudwego/kitex/internal/mocks"
+	remotemocks "github.com/cloudwego/kitex/internal/mocks/remote"
 	"github.com/cloudwego/kitex/internal/test"
 	"github.com/cloudwego/kitex/pkg/remote"
 	"github.com/cloudwego/kitex/pkg/remote/trans"
 	"github.com/cloudwego/kitex/pkg/rpcinfo"
-	"github.com/cloudwego/netpoll"
 )
 
 var (
@@ -54,7 +57,11 @@ func init() {
 // TestHTTPWrite test http_client_handler Write return err
 func TestHTTPWrite(t *testing.T) {
 	// 1. prepare mock data
-	conn := &MockNetpollConn{}
+	conn := &MockNetpollConn{
+		WriterFunc: func() netpoll.Writer {
+			return netpoll.NewWriter(&bytes.Buffer{})
+		},
+	}
 	rwTimeout := time.Second
 	cfg := rpcinfo.NewRPCConfig()
 	rpcinfo.AsMutableRPCConfig(cfg).SetReadWriteTimeout(rwTimeout)
@@ -66,9 +73,10 @@ func TestHTTPWrite(t *testing.T) {
 	msg := remote.NewMessage(nil, mocks.ServiceInfo(), ri, remote.Reply, remote.Client)
 
 	// 2. test
-	err := httpCilTransHdlr.Write(ctx, conn, msg)
-	// check err not nil
-	test.Assert(t, err != nil)
+	ctx, err := httpCilTransHdlr.Write(ctx, conn, msg)
+	// check ctx/err not nil
+	test.Assert(t, err == nil, err)
+	test.Assert(t, ctx != nil)
 }
 
 // TestHTTPRead test http_client_handler Read return err
@@ -101,8 +109,9 @@ func TestHTTPRead(t *testing.T) {
 	msg := remote.NewMessage(nil, mocks.ServiceInfo(), ri, remote.Reply, remote.Client)
 
 	// 2. test
-	err := httpCilTransHdlr.Read(ctx, conn, msg)
-	// check err not nil
+	ctx, err := httpCilTransHdlr.Read(ctx, conn, msg)
+	// check ctx/err not nil
+	test.Assert(t, ctx != nil)
 	test.Assert(t, err != nil)
 
 	rpcinfo.AsMutableRPCConfig(cfg).SetRPCTimeout(rwTimeout)
@@ -115,10 +124,10 @@ func TestHTTPRead(t *testing.T) {
 func TestHTTPOnMessage(t *testing.T) {
 	// 1. prepare mock data
 	svcInfo := mocks.ServiceInfo()
-
+	svcSearcher := remotemocks.NewDefaultSvcSearcher()
 	ri := rpcinfo.NewRPCInfo(nil, nil, rpcinfo.NewInvocation(svcInfo.ServiceName, method), nil, rpcinfo.NewRPCStats())
 	ctx := rpcinfo.NewCtxWithRPCInfo(context.Background(), ri)
-	recvMsg := remote.NewMessageWithNewer(svcInfo, ri, remote.Call, remote.Server)
+	recvMsg := remote.NewMessageWithNewer(svcInfo, svcSearcher, ri, remote.Call, remote.Server)
 	sendMsg := remote.NewMessage(svcInfo.MethodInfo(method).NewResult(), svcInfo, ri, remote.Reply, remote.Server)
 
 	// 2. test
@@ -171,7 +180,8 @@ func TestSkipToBody(t *testing.T) {
 	err := skipToBody(reader)
 	test.Assert(t, err == nil)
 
-	getBody, err := reader.ReadBinary(reader.ReadableLen())
+	getBody := make([]byte, reader.ReadableLen())
+	_, err = reader.ReadBinary(getBody)
 	test.Assert(t, err == nil)
 	test.Assert(t, strings.Compare(string(getBody), wantBody) == 0)
 }

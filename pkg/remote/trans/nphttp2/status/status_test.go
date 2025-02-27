@@ -21,15 +21,16 @@ import (
 	"fmt"
 	"testing"
 
+	spb "google.golang.org/genproto/googleapis/rpc/status"
+
 	"github.com/cloudwego/kitex/internal/test"
 	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/codes"
-	spb "google.golang.org/genproto/googleapis/rpc/status"
 )
 
 func TestStatus(t *testing.T) {
 	// test ok status
 	statusMsg := "test"
-	statusOk := Newf(codes.OK, statusMsg)
+	statusOk := Newf(codes.OK, "%s", statusMsg)
 	test.Assert(t, statusOk.Code() == codes.OK)
 	test.Assert(t, statusOk.Message() == statusMsg)
 	test.Assert(t, statusOk.Err() == nil)
@@ -49,7 +50,7 @@ func TestStatus(t *testing.T) {
 	test.Assert(t, emptyDetail == nil)
 
 	// test error status
-	notFoundErr := Errorf(codes.NotFound, statusMsg)
+	notFoundErr := Errorf(codes.NotFound, "%s", statusMsg)
 	statusErr, ok := FromError(notFoundErr)
 	test.Assert(t, ok)
 	test.Assert(t, statusErr.Code() == codes.NotFound)

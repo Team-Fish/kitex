@@ -23,16 +23,18 @@ import (
 	"net"
 	"sync/atomic"
 
-	stats2 "github.com/cloudwego/kitex/internal/stats"
+	"github.com/cloudwego/gopkg/protocol/ttheader"
+	"github.com/cloudwego/netpoll"
+
 	"github.com/cloudwego/kitex/pkg/kerrors"
 	"github.com/cloudwego/kitex/pkg/klog"
 	"github.com/cloudwego/kitex/pkg/remote"
 	"github.com/cloudwego/kitex/pkg/remote/codec"
 	"github.com/cloudwego/kitex/pkg/remote/trans"
 	np "github.com/cloudwego/kitex/pkg/remote/trans/netpoll"
+	"github.com/cloudwego/kitex/pkg/rpcinfo"
 	"github.com/cloudwego/kitex/pkg/serviceinfo"
 	"github.com/cloudwego/kitex/pkg/stats"
-	"github.com/cloudwego/netpoll"
 )
 
 type cliTransHandlerFactory struct{}
@@ -45,7 +47,7 @@ func NewCliTransHandlerFactory() remote.ClientTransHandlerFactory {
 // NewTransHandler implements the remote.ClientTransHandlerFactory interface.
 func (f *cliTransHandlerFactory) NewTransHandler(opt *remote.ClientOption) (remote.ClientTransHandler, error) {
 	if _, ok := opt.ConnPool.(*MuxPool); !ok {
-		return nil, fmt.Errorf("ConnPool[%T] invalid, netpoll mux just suppot MuxPool", opt.ConnPool)
+		return nil, fmt.Errorf("ConnPool[%T] invalid, netpoll mux just support MuxPool", opt.ConnPool)
 	}
 	return newCliTransHandler(opt)
 }
@@ -66,9 +68,9 @@ type cliTransHandler struct {
 }
 
 // Write implements the remote.ClientTransHandler interface.
-func (t *cliTransHandler) Write(ctx context.Context, conn net.Conn, sendMsg remote.Message) (err error) {
+func (t *cliTransHandler) Write(ctx context.Context, conn net.Conn, sendMsg remote.Message) (nctx context.Context, err error) {
 	ri := sendMsg.RPCInfo()
-	stats2.Record(ctx, ri, stats.WriteStart, nil)
+	rpcinfo.Record(ctx, ri, stats.WriteStart, nil)
 	buf := netpoll.NewLinkBuffer()
 	bufWriter := np.NewWriterByteBuffer(buf)
 	defer func() {
@@ -76,7 +78,7 @@ func (t *cliTransHandler) Write(ctx context.Context, conn net.Conn, sendMsg remo
 			buf.Close()
 			bufWriter.Release(err)
 		}
-		stats2.Record(ctx, ri, stats.WriteFinish, nil)
+		rpcinfo.Record(ctx, ri, stats.WriteFinish, nil)
 	}()
 
 	// Set header flag = 1
@@ -84,13 +86,13 @@ func (t *cliTransHandler) Write(ctx context.Context, conn net.Conn, sendMsg remo
 	if tags == nil {
 		tags = make(map[string]interface{})
 	}
-	tags[codec.HeaderFlagsKey] = codec.HeaderFlagSupportOutOfOrder
+	tags[codec.HeaderFlagsKey] = ttheader.HeaderFlagSupportOutOfOrder
 
 	// encode
 	sendMsg.SetPayloadCodec(t.opt.PayloadCodec)
 	err = t.codec.Encode(ctx, sendMsg, bufWriter)
 	if err != nil {
-		return err
+		return ctx, err
 	}
 
 	mc, _ := conn.(*muxCliConn)
@@ -98,13 +100,13 @@ func (t *cliTransHandler) Write(ctx context.Context, conn net.Conn, sendMsg remo
 	// if oneway
 	var methodInfo serviceinfo.MethodInfo
 	if methodInfo, err = trans.GetMethodInfo(ri, sendMsg.ServiceInfo()); err != nil {
-		return err
+		return ctx, err
 	}
 	if methodInfo.OneWay() {
 		mc.Put(func() (_ netpoll.Writer, isNil bool) {
 			return buf, false
 		})
-		return nil
+		return ctx, nil
 	}
 
 	// add notify
@@ -112,11 +114,11 @@ func (t *cliTransHandler) Write(ctx context.Context, conn net.Conn, sendMsg remo
 	callback := newAsyncCallback(buf, bufWriter)
 	mc.seqIDMap.store(seqID, callback)
 	mc.Put(callback.getter)
-	return err
+	return ctx, err
 }
 
 // Read implements the remote.ClientTransHandler interface.
-func (t *cliTransHandler) Read(ctx context.Context, conn net.Conn, msg remote.Message) error {
+func (t *cliTransHandler) Read(ctx context.Context, conn net.Conn, msg remote.Message) (nctx context.Context, err error) {
 	ri := msg.RPCInfo()
 	mc, _ := conn.(*muxCliConn)
 	seqID := ri.Invocation().SeqID()
@@ -136,13 +138,13 @@ func (t *cliTransHandler) Read(ctx context.Context, conn net.Conn, msg remote.Me
 	select {
 	case <-ctx.Done():
 		// timeout
-		return fmt.Errorf("recv wait timeout %s, seqID=%d", readTimeout, seqID)
+		return ctx, fmt.Errorf("recv wait timeout %s, seqID=%d", readTimeout, seqID)
 	case bufReader := <-callback.notifyChan:
 		// recv
 		if bufReader == nil {
-			return ErrConnClosed
+			return ctx, ErrConnClosed
 		}
-		stats2.Record(ctx, ri, stats.ReadStart, nil)
+		rpcinfo.Record(ctx, ri, stats.ReadStart, nil)
 		msg.SetPayloadCodec(t.opt.PayloadCodec)
 		err := t.codec.Decode(ctx, msg, bufReader)
 		if err != nil && errors.Is(err, netpoll.ErrReadTimeout) {
@@ -152,8 +154,8 @@ func (t *cliTransHandler) Read(ctx context.Context, conn net.Conn, msg remote.Me
 			bufReader.Skip(l)
 		}
 		bufReader.Release(nil)
-		stats2.Record(ctx, ri, stats.ReadFinish, err)
-		return err
+		rpcinfo.Record(ctx, ri, stats.ReadFinish, err)
+		return ctx, err
 	}
 }
 

@@ -34,6 +34,13 @@ func init() {
 	connWrapperPool.New = newConnWrapper
 }
 
+var _ ConnReleaser = &ConnWrapper{}
+
+// ConnReleaser helps to release the raw connection.
+type ConnReleaser interface {
+	ReleaseConn(err error, ri rpcinfo.RPCInfo)
+}
+
 // ConnWrapper wraps a connection.
 type ConnWrapper struct {
 	connPool remote.ConnPool
@@ -77,7 +84,8 @@ func (cm *ConnWrapper) ReleaseConn(err error, ri rpcinfo.RPCInfo) {
 	}
 	if cm.connPool != nil {
 		if err == nil {
-			if _, ok := ri.To().Tag(rpcinfo.ConnResetTag); ok {
+			_, ok := ri.To().Tag(rpcinfo.ConnResetTag)
+			if ok || ri.Config().InteractionMode() == rpcinfo.Oneway {
 				cm.connPool.Discard(cm.conn)
 			} else {
 				cm.connPool.Put(cm.conn)
@@ -103,7 +111,8 @@ func (cm *ConnWrapper) zero() {
 }
 
 func (cm *ConnWrapper) getConnWithPool(ctx context.Context, cp remote.ConnPool, d remote.Dialer,
-	timeout time.Duration, ri rpcinfo.RPCInfo) (net.Conn, error) {
+	timeout time.Duration, ri rpcinfo.RPCInfo,
+) (net.Conn, error) {
 	addr := ri.To().Address()
 	if addr == nil {
 		return nil, kerrors.ErrNoDestAddress
@@ -120,7 +129,8 @@ func (cm *ConnWrapper) getConnWithPool(ctx context.Context, cp remote.ConnPool, 
 }
 
 func (cm *ConnWrapper) getConnWithDialer(ctx context.Context, d remote.Dialer,
-	timeout time.Duration, ri rpcinfo.RPCInfo) (net.Conn, error) {
+	timeout time.Duration, ri rpcinfo.RPCInfo,
+) (net.Conn, error) {
 	addr := ri.To().Address()
 	if addr == nil {
 		return nil, kerrors.ErrNoDestAddress

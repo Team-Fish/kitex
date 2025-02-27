@@ -21,10 +21,15 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"sync/atomic"
 
+	"github.com/cloudwego/kitex/pkg/streamx"
+
 	"github.com/bytedance/gopkg/cloud/metainfo"
+	"github.com/cloudwego/localsession/backup"
+
 	"github.com/cloudwego/kitex/client/callopt"
 	"github.com/cloudwego/kitex/internal/client"
 	"github.com/cloudwego/kitex/pkg/acl"
@@ -32,6 +37,8 @@ import (
 	"github.com/cloudwego/kitex/pkg/diagnosis"
 	"github.com/cloudwego/kitex/pkg/discovery"
 	"github.com/cloudwego/kitex/pkg/endpoint"
+	"github.com/cloudwego/kitex/pkg/event"
+	"github.com/cloudwego/kitex/pkg/fallback"
 	"github.com/cloudwego/kitex/pkg/kerrors"
 	"github.com/cloudwego/kitex/pkg/klog"
 	"github.com/cloudwego/kitex/pkg/loadbalance"
@@ -45,7 +52,6 @@ import (
 	"github.com/cloudwego/kitex/pkg/rpcinfo/remoteinfo"
 	"github.com/cloudwego/kitex/pkg/rpctimeout"
 	"github.com/cloudwego/kitex/pkg/serviceinfo"
-	"github.com/cloudwego/kitex/pkg/transmeta"
 	"github.com/cloudwego/kitex/pkg/utils"
 	"github.com/cloudwego/kitex/pkg/warmup"
 	"github.com/cloudwego/kitex/transport"
@@ -66,11 +72,29 @@ type kClient struct {
 	mws     []endpoint.Middleware
 	eps     endpoint.Endpoint
 	sEps    endpoint.Endpoint
-	opt     *client.Options
-	lbf     *lbcache.BalancerFactory
+
+	// streamx
+	sxStreamMW     streamx.StreamMiddleware
+	sxStreamRecvMW streamx.StreamRecvMiddleware
+	sxStreamSendMW streamx.StreamSendMiddleware
+
+	opt *client.Options
+	lbf *lbcache.BalancerFactory
 
 	inited bool
 	closed bool
+}
+
+// Set finalizer on kClient does not take effect, because kClient has a circular reference problem
+// when construct the endpoint.Endpoint in the invokeHandleEndpoint,
+// so wrapping kClient as kcFinalizerClient, and set finalizer on kcFinalizerClient, it can solve this problem.
+type kcFinalizerClient struct {
+	*kClient
+}
+
+func (kf *kcFinalizerClient) Call(ctx context.Context, method string, request, response interface{}) error {
+	defer runtime.KeepAlive(kf)
+	return kf.kClient.Call(ctx, method, request, response)
 }
 
 // NewClient creates a kitex.Client with the given ServiceInfo, it is from generated code.
@@ -78,16 +102,16 @@ func NewClient(svcInfo *serviceinfo.ServiceInfo, opts ...Option) (Client, error)
 	if svcInfo == nil {
 		return nil, errors.New("NewClient: no service info")
 	}
-	kc := &kClient{
-		svcInfo: svcInfo,
-		opt:     client.NewOptions(opts),
-	}
+	kc := &kcFinalizerClient{kClient: &kClient{}}
+	kc.svcInfo = svcInfo
+	kc.opt = client.NewOptions(opts)
 	if err := kc.init(); err != nil {
+		_ = kc.Close()
 		return nil, err
 	}
 	// like os.File, if kc is garbage-collected, but Close is not called, call Close.
-	runtime.SetFinalizer(kc, func(c *kClient) {
-		c.Close()
+	runtime.SetFinalizer(kc, func(c *kcFinalizerClient) {
+		_ = c.Close()
 	})
 	return kc, nil
 }
@@ -106,11 +130,15 @@ func (kc *kClient) init() (err error) {
 	if err = kc.initProxy(); err != nil {
 		return err
 	}
+	if err = kc.initConnPool(); err != nil {
+		return err
+	}
 	if err = kc.initLBCache(); err != nil {
 		return err
 	}
 	ctx := kc.initContext()
 	kc.initMiddlewares(ctx)
+	kc.initStreamMiddlewares(ctx)
 	kc.initDebugService()
 	kc.richRemoteOption()
 	if err = kc.buildInvokeChain(); err != nil {
@@ -139,12 +167,12 @@ func (kc *kClient) initCircuitBreaker() error {
 
 func (kc *kClient) initRetryer() error {
 	if kc.opt.RetryContainer == nil {
-		if kc.opt.RetryPolicy == nil {
+		if kc.opt.RetryMethodPolicies == nil {
 			return nil
 		}
-		kc.opt.RetryContainer = retry.NewRetryContainer()
+		kc.opt.InitRetryContainer()
 	}
-	return kc.opt.RetryContainer.Init(kc.opt.RetryPolicy)
+	return kc.opt.RetryContainer.Init(kc.opt.RetryMethodPolicies, kc.opt.RetryWithResult)
 }
 
 func (kc *kClient) initContext() context.Context {
@@ -174,8 +202,39 @@ func (kc *kClient) initProxy() error {
 		// update fields in the client option for further use.
 		kc.opt.Resolver = cfg.Resolver
 		kc.opt.Balancer = cfg.Balancer
+		// close predefined pool when proxy init new pool.
+		if cfg.Pool != kc.opt.RemoteOpt.ConnPool && kc.opt.RemoteOpt.ConnPool != nil {
+			kc.opt.RemoteOpt.ConnPool.Close()
+		}
 		kc.opt.RemoteOpt.ConnPool = cfg.Pool
 		kc.opt.Targets = cfg.FixedTargets
+	}
+	return nil
+}
+
+func (kc *kClient) initConnPool() error {
+	pool := kc.opt.RemoteOpt.ConnPool
+	kc.opt.CloseCallbacks = append(kc.opt.CloseCallbacks, pool.Close)
+
+	if df, ok := pool.(interface{ Dump() interface{} }); ok {
+		kc.opt.DebugService.RegisterProbeFunc(diagnosis.ConnPoolKey, df.Dump)
+	}
+	if r, ok := pool.(remote.ConnPoolReporter); ok && kc.opt.RemoteOpt.EnableConnPoolReporter {
+		r.EnableReporter()
+	}
+
+	if long, ok := pool.(remote.LongConnPool); ok {
+		kc.opt.Bus.Watch(discovery.ChangeEventName, func(ev *event.Event) {
+			ch, ok := ev.Extra.(*discovery.Change)
+			if !ok {
+				return
+			}
+			for _, inst := range ch.Removed {
+				if addr := inst.Address(); addr != nil {
+					long.Clean(addr.Network(), addr.String())
+				}
+			}
+		})
 	}
 	return nil
 }
@@ -197,11 +256,14 @@ func (kc *kClient) initLBCache() error {
 			NameFunc: func() string { return "no_resolver" },
 		}
 	}
+	// because we cannot ensure that user's custom loadbalancer is cacheable, we need to disable it here
+	cacheOpts := lbcache.Options{DiagnosisService: kc.opt.DebugService, Cacheable: false}
 	balancer := kc.opt.Balancer
 	if balancer == nil {
+		// default internal lb balancer is cacheable
+		cacheOpts.Cacheable = true
 		balancer = loadbalance.NewWeightedBalancer()
 	}
-	cacheOpts := lbcache.Options{DiagnosisService: kc.opt.DebugService}
 	if kc.opt.BalancerCacheOpt != nil {
 		cacheOpts = *kc.opt.BalancerCacheOpt
 	}
@@ -221,7 +283,11 @@ func (kc *kClient) initLBCache() error {
 
 func (kc *kClient) initMiddlewares(ctx context.Context) {
 	builderMWs := richMWsWithBuilder(ctx, kc.opt.MWBs)
-	kc.mws = append(kc.mws, kc.opt.CBSuite.ServiceCBMW(), rpcTimeoutMW(ctx))
+	// integrate xds if enabled
+	if kc.opt.XDSEnabled && kc.opt.XDSRouterMiddleware != nil && kc.opt.Proxy == nil {
+		kc.mws = append(kc.mws, kc.opt.XDSRouterMiddleware)
+	}
+	kc.mws = append(kc.mws, kc.opt.CBSuite.ServiceCBMW(), rpcTimeoutMW(ctx), contextMW)
 	kc.mws = append(kc.mws, builderMWs...)
 	kc.mws = append(kc.mws, acl.NewACLMiddleware(kc.opt.ACLRules))
 	if kc.opt.Proxy == nil {
@@ -237,114 +303,117 @@ func (kc *kClient) initMiddlewares(ctx context.Context) {
 	kc.mws = append(kc.mws, newIOErrorHandleMW(kc.opt.ErrHandle))
 }
 
+func (kc *kClient) initStreamMiddlewares(ctx context.Context) {
+	kc.opt.Streaming.EventHandler = kc.opt.TracerCtl.GetStreamEventHandler()
+	kc.opt.Streaming.InitMiddlewares(ctx)
+}
+
 func richMWsWithBuilder(ctx context.Context, mwBs []endpoint.MiddlewareBuilder) (mws []endpoint.Middleware) {
 	for i := range mwBs {
-		mws = append(mws, mwBs[i](ctx))
+		if mw := mwBs[i](ctx); mw != nil {
+			mws = append(mws, mw)
+		}
 	}
 	return
 }
 
 // initRPCInfo initializes the RPCInfo structure and attaches it to context.
-func (kc *kClient) initRPCInfo(ctx context.Context, method string) (context.Context, rpcinfo.RPCInfo) {
-	cfg := rpcinfo.AsMutableRPCConfig(kc.opt.Configs).Clone()
-	rmt := remoteinfo.NewRemoteInfo(kc.opt.Svr, method)
-	ctx = kc.applyCallOptions(ctx, cfg.ImmutableView(), rmt)
-	rpcStats := rpcinfo.AsMutableRPCStats(rpcinfo.NewRPCStats())
-	if kc.opt.StatsLevel != nil {
-		rpcStats.SetLevel(*kc.opt.StatsLevel)
-	}
-
-	// Export read-only views to external users.
-	ri := rpcinfo.NewRPCInfo(
-		rpcinfo.FromBasicInfo(kc.opt.Cli),
-		rmt.ImmutableView(),
-		rpcinfo.NewInvocation(kc.svcInfo.ServiceName, method, kc.svcInfo.GetPackageName()),
-		cfg.ImmutableView(),
-		rpcStats.ImmutableView(),
-	)
-
-	if fromMethod := ctx.Value(consts.CtxKeyMethod); fromMethod != nil {
-		rpcinfo.AsMutableEndpointInfo(ri.From()).SetMethod(fromMethod.(string))
-	}
-
-	if p := kc.opt.Timeouts; p != nil {
-		if c := p.Timeouts(ri); c != nil {
-			_ = cfg.SetRPCTimeout(c.RPCTimeout())
-			_ = cfg.SetConnectTimeout(c.ConnectTimeout())
-			_ = cfg.SetReadWriteTimeout(c.ReadWriteTimeout())
-		}
-	}
-
-	ctx = rpcinfo.NewCtxWithRPCInfo(ctx, ri)
-	return ctx, ri
+func (kc *kClient) initRPCInfo(ctx context.Context, method string, retryTimes int, firstRI rpcinfo.RPCInfo) (context.Context, rpcinfo.RPCInfo, *callopt.CallOptions) {
+	return initRPCInfo(ctx, method, kc.opt, kc.svcInfo, retryTimes, firstRI)
 }
 
-func (kc *kClient) applyCallOptions(ctx context.Context, cfg rpcinfo.RPCConfig, svr remoteinfo.RemoteInfo) context.Context {
+func applyCallOptions(ctx context.Context, cfg rpcinfo.MutableRPCConfig, svr remoteinfo.RemoteInfo, opt *client.Options) (context.Context, *callopt.CallOptions) {
 	cos := CallOptionsFromCtx(ctx)
 	if len(cos) > 0 {
-		info := callopt.Apply(cos, cfg, svr, kc.opt.Locks, kc.opt.HTTPResolver)
+		info, callOpts := callopt.Apply(cos, cfg, svr, opt.Locks, opt.HTTPResolver)
 		ctx = context.WithValue(ctx, ctxCallOptionInfoKey, info)
-	} else {
-		kc.opt.Locks.ApplyLocks(cfg, svr)
+		return ctx, callOpts
 	}
-	return ctx
+	opt.Locks.ApplyLocks(cfg, svr)
+	return ctx, nil
 }
 
 // Call implements the Client interface .
-func (kc *kClient) Call(ctx context.Context, method string, request, response interface{}) error {
-	if !kc.inited {
-		panic("client not initialized")
-	}
-	if kc.closed {
-		panic("client is already closed")
-	}
-	if ctx == nil {
-		panic("ctx is nil")
-	}
+func (kc *kClient) Call(ctx context.Context, method string, request, response interface{}) (err error) {
+	// merge backup context if no metainfo found in ctx
+	ctx = backup.RecoverCtxOnDemands(ctx, kc.opt.CtxBackupHandler)
+
+	validateForCall(ctx, kc.inited, kc.closed)
 	var ri rpcinfo.RPCInfo
-	ctx, ri = kc.initRPCInfo(ctx, method)
+	var callOpts *callopt.CallOptions
+	ctx, ri, callOpts = kc.initRPCInfo(ctx, method, 0, nil)
 
 	ctx = kc.opt.TracerCtl.DoStart(ctx, ri)
-
-	if kc.opt.RetryContainer == nil {
-		err := kc.eps(ctx, request, response)
-		kc.opt.TracerCtl.DoFinish(ctx, ri, err)
-		if err == nil {
+	var reportErr error
+	var recycleRI bool
+	defer func() {
+		if panicInfo := recover(); panicInfo != nil {
+			err = rpcinfo.ClientPanicToErr(ctx, panicInfo, ri, false)
+			reportErr = err
+		}
+		kc.opt.TracerCtl.DoFinish(ctx, ri, reportErr)
+		if recycleRI {
+			// why need check recycleRI to decide if recycle RPCInfo?
+			// 1. no retry, rpc timeout happen will cause panic when response return
+			// 2. retry success, will cause panic when first call return
+			// 3. backup request may cause panic, cannot recycle first RPCInfo
+			// RPCInfo will be recycled after rpc is finished,
+			// holding RPCInfo in a new goroutine is forbidden.
 			rpcinfo.PutRPCInfo(ri)
 		}
-		return err
+		callOpts.Recycle()
+	}()
+
+	callOptRetry := getCalloptRetryPolicy(callOpts)
+	if kc.opt.RetryContainer == nil && callOptRetry != nil && callOptRetry.Enable {
+		// setup retry in callopt
+		kc.opt.InitRetryContainer()
 	}
 
-	var callTimes int32
-	var prevRI rpcinfo.RPCInfo
-	recycleRI, err := kc.opt.RetryContainer.WithRetryIfNeeded(ctx, func(ctx context.Context, r retry.Retryer) (rpcinfo.RPCInfo, error) {
-		curCallTimes := int(atomic.AddInt32(&callTimes, 1))
-		retryCtx := ctx
-		cRI := ri
-		if curCallTimes > 1 {
-			retryCtx, cRI = kc.initRPCInfo(ctx, method)
-			retryCtx = metainfo.WithPersistentValue(retryCtx, retry.TransitKey, strconv.Itoa(curCallTimes-1))
-			if prevRI == nil {
-				prevRI = ri
-			}
-			r.Prepare(retryCtx, prevRI, cRI)
-			prevRI = cRI
+	// Add necessary keys to context for isolation between kitex client method calls
+	ctx = retry.PrepareRetryContext(ctx)
+
+	if kc.opt.RetryContainer == nil {
+		// call without retry policy
+		err = kc.eps(ctx, request, response)
+		if err == nil {
+			recycleRI = true
 		}
-		err := kc.eps(retryCtx, request, response)
-		return cRI, err
-	}, ri, request)
-
-	kc.opt.TracerCtl.DoFinish(ctx, ri, err)
-	if recycleRI {
-		// why need check recycleRI to decide if recycle RPCInfo?
-		// 1. no retry, rpc timeout happen will cause panic when response return
-		// 2. retry success, will cause panic when first call return
-		// 3. backup request may cause panic, cannot recycle first RPCInfo
-		// RPCInfo will be recycled after rpc is finished,
-		// holding RPCInfo in a new goroutine is forbidden.
-		rpcinfo.PutRPCInfo(ri)
+	} else {
+		var lastRI rpcinfo.RPCInfo
+		lastRI, recycleRI, err = kc.opt.RetryContainer.WithRetryIfNeeded(ctx, callOptRetry, kc.rpcCallWithRetry(ri, method, request, response), ri, request)
+		if ri != lastRI {
+			// reset ri of ctx to lastRI
+			ctx = rpcinfo.NewCtxWithRPCInfo(ctx, lastRI)
+		}
+		ri = lastRI
 	}
+
+	// do fallback if with setup
+	err, reportErr = doFallbackIfNeeded(ctx, ri, request, response, err, kc.opt.Fallback, callOpts)
 	return err
+}
+
+func (kc *kClient) rpcCallWithRetry(ri rpcinfo.RPCInfo, method string, request, response interface{}) retry.RPCCallFunc {
+	// call with retry policy
+	var callTimes int32
+	// prevRI represents a value of rpcinfo.RPCInfo type.
+	var prevRI atomic.Value
+	return func(ctx context.Context, r retry.Retryer) (rpcinfo.RPCInfo, interface{}, error) {
+		currCallTimes := int(atomic.AddInt32(&callTimes, 1))
+		cRI := ri
+		if currCallTimes > 1 {
+			ctx, cRI, _ = kc.initRPCInfo(ctx, method, currCallTimes-1, ri)
+			ctx = metainfo.WithPersistentValue(ctx, retry.TransitKey, strconv.Itoa(currCallTimes-1))
+			if prevRI.Load() == nil {
+				prevRI.Store(ri)
+			}
+			r.Prepare(ctx, prevRI.Load().(rpcinfo.RPCInfo), cRI)
+			prevRI.Store(cRI)
+		}
+		callErr := kc.eps(ctx, request, response)
+		return cRI, response, callErr
+	}
 }
 
 func (kc *kClient) initDebugService() {
@@ -352,41 +421,43 @@ func (kc *kClient) initDebugService() {
 		ds.RegisterProbeFunc(diagnosis.DestServiceKey, diagnosis.WrapAsProbeFunc(kc.opt.Svr.ServiceName))
 		ds.RegisterProbeFunc(diagnosis.OptionsKey, diagnosis.WrapAsProbeFunc(kc.opt.DebugInfo))
 		ds.RegisterProbeFunc(diagnosis.ChangeEventsKey, kc.opt.Events.Dump)
-		ds.RegisterProbeFunc(diagnosis.ServiceInfoKey, diagnosis.WrapAsProbeFunc(kc.svcInfo))
+		ds.RegisterProbeFunc(diagnosis.ServiceInfosKey, diagnosis.WrapAsProbeFunc(map[string]*serviceinfo.ServiceInfo{kc.svcInfo.ServiceName: kc.svcInfo}))
 	}
 }
 
 func (kc *kClient) richRemoteOption() {
 	kc.opt.RemoteOpt.SvcInfo = kc.svcInfo
-	// add default meta handler
-	if len(kc.opt.MetaHandlers) == 0 {
-		if kc.opt.Configs.TransportProtocol()&transport.GRPC == transport.GRPC {
-			kc.opt.MetaHandlers = append(kc.opt.MetaHandlers, transmeta.ClientHTTP2Handler)
-		}
-		if kc.opt.Configs.TransportProtocol()&transport.TTHeader == transport.TTHeader {
-			kc.opt.MetaHandlers = append(kc.opt.MetaHandlers, transmeta.ClientTTHeaderHandler)
+	// for client trans info handler
+	if len(kc.opt.MetaHandlers) > 0 {
+		// TODO in stream situations, meta is only assembled when the stream creates
+		// metaHandler needs to be called separately.
+		// (newClientStreamer: call WriteMeta before remotecli.NewClient)
+		transInfoHdlr := bound.NewTransMetaHandler(kc.opt.MetaHandlers)
+		kc.opt.RemoteOpt.PrependBoundHandler(transInfoHdlr)
+
+		// add meta handlers into streaming meta handlers
+		for _, h := range kc.opt.MetaHandlers {
+			if shdlr, ok := h.(remote.StreamingMetaHandler); ok {
+				kc.opt.RemoteOpt.StreamingMetaHandlers = append(kc.opt.RemoteOpt.StreamingMetaHandlers, shdlr)
+			}
 		}
 	}
-	// for client trans info handler
-	// TODO in stream situations, meta is only assembled when the stream creates
-	// metaHandler needs to be called separately.
-	// (newClientStreamer: call WriteMeta before remotecli.NewClient)
-	transInfoHdlr := bound.NewTransMetaHandler(kc.opt.MetaHandlers)
-	kc.opt.RemoteOpt.PrependBoundHandler(transInfoHdlr)
 }
 
 func (kc *kClient) buildInvokeChain() error {
+	mwchain := endpoint.Chain(kc.mws...)
+
 	innerHandlerEp, err := kc.invokeHandleEndpoint()
 	if err != nil {
 		return err
 	}
-	kc.eps = endpoint.Chain(kc.mws...)(innerHandlerEp)
+	kc.eps = mwchain(innerHandlerEp)
 
 	innerStreamingEp, err := kc.invokeStreamingEndpoint()
 	if err != nil {
 		return err
 	}
-	kc.sEps = endpoint.Chain(kc.mws...)(innerStreamingEp)
+	kc.sEps = mwchain(innerStreamingEp)
 	return nil
 }
 
@@ -415,12 +486,15 @@ func (kc *kClient) invokeHandleEndpoint() (endpoint.Endpoint, error) {
 		defer cli.Recycle()
 		config := ri.Config()
 		m := kc.svcInfo.MethodInfo(methodName)
-		if m.OneWay() {
+		if m == nil {
+			return fmt.Errorf("method info is nil, methodName=%s, serviceInfo=%+v", methodName, kc.svcInfo)
+		} else if m.OneWay() {
 			sendMsg = remote.NewMessage(req, kc.svcInfo, ri, remote.Oneway, remote.Client)
 		} else {
 			sendMsg = remote.NewMessage(req, kc.svcInfo, ri, remote.Call, remote.Client)
 		}
-		sendMsg.SetProtocolInfo(remote.NewProtocolInfo(config.TransportProtocol(), kc.svcInfo.PayloadCodec))
+		protocolInfo := remote.NewProtocolInfo(config.TransportProtocol(), kc.svcInfo.PayloadCodec)
+		sendMsg.SetProtocolInfo(protocolInfo)
 
 		if err = cli.Send(ctx, ri, sendMsg); err != nil {
 			return
@@ -431,6 +505,7 @@ func (kc *kClient) invokeHandleEndpoint() (endpoint.Endpoint, error) {
 		}
 
 		recvMsg = remote.NewMessage(resp, kc.opt.RemoteOpt.SvcInfo, ri, remote.Reply, remote.Client)
+		recvMsg.SetProtocolInfo(protocolInfo)
 		err = cli.Recv(ctx, ri, recvMsg)
 		return err
 	}, nil
@@ -438,8 +513,13 @@ func (kc *kClient) invokeHandleEndpoint() (endpoint.Endpoint, error) {
 
 // Close is not concurrency safe.
 func (kc *kClient) Close() error {
+	defer func() {
+		if err := recover(); err != nil {
+			klog.Warnf("KITEX: panic when close client, error=%s, stack=%s", err, string(debug.Stack()))
+		}
+	}()
 	if kc.closed {
-		panic("client is already closed")
+		return nil
 	}
 	kc.closed = true
 	var errs utils.ErrChain
@@ -453,7 +533,6 @@ func (kc *kClient) Close() error {
 			errs.Append(err)
 		}
 	}
-	runtime.SetFinalizer(kc, nil)
 	if errs.HasError() {
 		return errs
 	}
@@ -476,9 +555,11 @@ func newCliTransHandler(opt *remote.ClientOption) (remote.ClientTransHandler, er
 }
 
 func initTransportProtocol(svcInfo *serviceinfo.ServiceInfo, cfg rpcinfo.RPCConfig) {
+	mutableRPCConfig := rpcinfo.AsMutableRPCConfig(cfg)
+	mutableRPCConfig.SetPayloadCodec(svcInfo.PayloadCodec)
 	if svcInfo.PayloadCodec == serviceinfo.Protobuf && cfg.TransportProtocol()&transport.GRPC != transport.GRPC {
 		// pb use ttheader framed by default
-		rpcinfo.AsMutableRPCConfig(cfg).SetTransportProtocol(transport.TTHeaderFramed)
+		mutableRPCConfig.SetTransportProtocol(transport.TTHeaderFramed)
 	}
 }
 
@@ -506,7 +587,7 @@ func (kc *kClient) warmingUp() error {
 		// build a default destination for the resolver
 		cfg := rpcinfo.AsMutableRPCConfig(kc.opt.Configs).Clone()
 		rmt := remoteinfo.NewRemoteInfo(kc.opt.Svr, "*")
-		ctx = kc.applyCallOptions(ctx, cfg.ImmutableView(), rmt)
+		ctx, _ = applyCallOptions(ctx, cfg, rmt, kc.opt)
 		dests = append(dests, rmt.ImmutableView())
 	}
 
@@ -566,4 +647,125 @@ func (kc *kClient) warmingUp() error {
 	}
 
 	return nil
+}
+
+func validateForCall(ctx context.Context, inited, closed bool) {
+	if !inited {
+		panic("client not initialized")
+	}
+	if closed {
+		panic("client is already closed")
+	}
+	if ctx == nil {
+		panic("ctx is nil")
+	}
+}
+
+func getCalloptRetryPolicy(callOpts *callopt.CallOptions) (callOptRetry *retry.Policy) {
+	if callOpts != nil {
+		if callOpts.RetryPolicy.Enable {
+			callOptRetry = &callOpts.RetryPolicy
+		}
+	}
+	return
+}
+
+func doFallbackIfNeeded(ctx context.Context, ri rpcinfo.RPCInfo, request, response interface{}, oriErr error, cliFallback *fallback.Policy, callOpts *callopt.CallOptions) (err, reportErr error) {
+	fallback, hasFallback := getFallbackPolicy(cliFallback, callOpts)
+	err = oriErr
+	reportErr = oriErr
+	var fbErr error
+	if hasFallback {
+		reportAsFB := false
+		// Notice: If rpc err is nil, rpcStatAsFB will always be false, even if it's set to true by user.
+		fbErr, reportAsFB = fallback.DoIfNeeded(ctx, ri, request, response, oriErr)
+		if reportAsFB {
+			reportErr = fbErr
+		}
+		err = fbErr
+	}
+
+	if err == nil && !hasFallback {
+		err = ri.Invocation().BizStatusErr()
+	}
+	return
+}
+
+// return fallback policy from call option and client option.
+func getFallbackPolicy(cliOptFB *fallback.Policy, callOpts *callopt.CallOptions) (fb *fallback.Policy, hasFallback bool) {
+	var callOptFB *fallback.Policy
+	if callOpts != nil {
+		callOptFB = callOpts.Fallback
+	}
+	if callOptFB != nil {
+		return callOptFB, true
+	}
+	if cliOptFB != nil {
+		return cliOptFB, true
+	}
+	return nil, false
+}
+
+func initRPCInfo(ctx context.Context, method string, opt *client.Options, svcInfo *serviceinfo.ServiceInfo, retryTimes int, firstRI rpcinfo.RPCInfo) (context.Context, rpcinfo.RPCInfo, *callopt.CallOptions) {
+	cfg := rpcinfo.AsMutableRPCConfig(opt.Configs).Clone()
+	rmt := remoteinfo.NewRemoteInfo(opt.Svr, method)
+	var callOpts *callopt.CallOptions
+	ctx, callOpts = applyCallOptions(ctx, cfg, rmt, opt)
+	var rpcStats rpcinfo.MutableRPCStats
+	if firstRI != nil {
+		rpcStats = rpcinfo.AsMutableRPCStats(firstRI.Stats().CopyForRetry())
+	} else {
+		rpcStats = rpcinfo.AsMutableRPCStats(rpcinfo.NewRPCStats())
+	}
+	if opt.StatsLevel != nil {
+		rpcStats.SetLevel(*opt.StatsLevel)
+	}
+
+	mi := svcInfo.MethodInfo(method)
+	if mi != nil && mi.OneWay() {
+		cfg.SetInteractionMode(rpcinfo.Oneway)
+	}
+	if retryTimes > 0 {
+		// it is used to distinguish the request is a local retry request.
+		rmt.SetTag(rpcinfo.RetryTag, strconv.Itoa(retryTimes))
+	}
+
+	// Export read-only views to external users.
+	ri := rpcinfo.NewRPCInfo(
+		rpcinfo.FromBasicInfo(opt.Cli),
+		rmt.ImmutableView(),
+		rpcinfo.NewInvocation(svcInfo.ServiceName, method, svcInfo.GetPackageName()),
+		cfg.ImmutableView(),
+		rpcStats.ImmutableView(),
+	)
+
+	if mi != nil {
+		ri.Invocation().(rpcinfo.InvocationSetter).SetStreamingMode(mi.StreamingMode())
+	}
+	if fromMethod := ctx.Value(consts.CtxKeyMethod); fromMethod != nil {
+		rpcinfo.AsMutableEndpointInfo(ri.From()).SetMethod(fromMethod.(string))
+	}
+
+	if p := opt.Timeouts; p != nil {
+		if c := p.Timeouts(ri); c != nil {
+			_ = cfg.SetRPCTimeout(c.RPCTimeout())
+			_ = cfg.SetConnectTimeout(c.ConnectTimeout())
+			_ = cfg.SetReadWriteTimeout(c.ReadWriteTimeout())
+		}
+	}
+
+	// streamx config
+	sopt := opt.StreamX
+	if sopt.RecvTimeout > 0 {
+		cfg.SetStreamRecvTimeout(sopt.RecvTimeout)
+	}
+
+	ctx = rpcinfo.NewCtxWithRPCInfo(ctx, ri)
+
+	if callOpts != nil && callOpts.CompressorName != "" {
+		// set send grpc compressor at client to tell how to server decode
+		remote.SetSendCompressor(ri, callOpts.CompressorName)
+	}
+
+	return ctx, ri, callOpts
 }

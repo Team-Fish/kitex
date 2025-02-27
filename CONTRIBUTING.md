@@ -3,9 +3,6 @@
 ## Your First Pull Request
 We use github for our codebase. You can start by reading [How To Pull Request](https://docs.github.com/en/github/collaborating-with-issues-and-pull-requests/about-pull-requests).
 
-## Without Semantic Versioning
-We keep the stable code in branch `main` like `golang.org/x`. Development base on branch `develop`. And we promise the **Forward Compatibility** by adding new package directory with suffix `v2/v3` when code has break changes.
-
 ## Branch Organization
 We use [git-flow](https://nvie.com/posts/a-successful-git-branching-model/) as our branch organization, as known as [FDD](https://en.wikipedia.org/wiki/Feature-driven_development)
 
@@ -34,7 +31,7 @@ Before you submit your Pull Request (PR) consider the following guidelines:
     ```
     git checkout -b my-fix-branch develop
     ```
-6. Create your patch, including appropriate test cases.
+6. Create your patch, including appropriate test cases. Please refer to [Go-UT](https://pkg.go.dev/testing#pkg-overview) for writing guides. [Go-Mock](https://github.com/golang/mock) is recommended to mock interface, please refer to internal/mocks/readme.md for more details, and [Mockey](https://github.com/bytedance/mockey) is recommended to mock functions, please refer to its readme doc for specific usage.
 7. Follow our [Style Guides](#code-style-guides).
 8. Commit your changes using a descriptive commit message that follows [AngularJS Git Commit Message Conventions](https://docs.google.com/document/d/1QrDFcIiPjSLDn3EL15IJygNPiHORgU1_OOAqWjiDU5Y/edit).
    Adherence to these conventions is necessary because release notes are automatically generated from these messages.

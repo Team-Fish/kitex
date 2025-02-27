@@ -72,6 +72,7 @@ var _ remote.Message = &MockMessage{}
 type MockMessage struct {
 	RPCInfoFunc         func() rpcinfo.RPCInfo
 	ServiceInfoFunc     func() *serviceinfo.ServiceInfo
+	SetServiceInfoFunc  func(svcName, methodName string) (*serviceinfo.ServiceInfo, error)
 	DataFunc            func() interface{}
 	NewDataFunc         func(method string) (ok bool)
 	MessageTypeFunc     func() remote.MessageType
@@ -100,6 +101,13 @@ func (m *MockMessage) ServiceInfo() (si *serviceinfo.ServiceInfo) {
 		return m.ServiceInfoFunc()
 	}
 	return
+}
+
+func (m *MockMessage) SpecifyServiceInfo(svcName, methodName string) (si *serviceinfo.ServiceInfo, err error) {
+	if m.SetServiceInfoFunc != nil {
+		return m.SetServiceInfoFunc(svcName, methodName)
+	}
+	return nil, nil
 }
 
 func (m *MockMessage) Data() interface{} {
@@ -207,6 +215,7 @@ type MockNetpollConn struct {
 	SetIdleTimeoutFunc   func(timeout time.Duration) (e error)
 	SetOnRequestFunc     func(on netpoll.OnRequest) (e error)
 	SetReadTimeoutFunc   func(timeout time.Duration) (e error)
+	SetWriteTimeoutFunc  func(timeout time.Duration) (e error)
 }
 
 // AddCloseCallback implements the netpoll.Connection interface.
@@ -261,6 +270,14 @@ func (m *MockNetpollConn) SetOnRequest(on netpoll.OnRequest) (e error) {
 func (m *MockNetpollConn) SetReadTimeout(timeout time.Duration) (e error) {
 	if m.SetReadTimeoutFunc != nil {
 		return m.SetReadTimeoutFunc(timeout)
+	}
+	return
+}
+
+// SetWriteTimeout implements the netpoll.Connection interface.
+func (m *MockNetpollConn) SetWriteTimeout(timeout time.Duration) (e error) {
+	if m.SetWriteTimeoutFunc != nil {
+		return m.SetWriteTimeoutFunc(timeout)
 	}
 	return
 }

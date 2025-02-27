@@ -20,9 +20,11 @@ import (
 	"context"
 	"net"
 
+	"github.com/cloudwego/kitex/pkg/kerrors"
 	"github.com/cloudwego/kitex/pkg/remote"
-	"github.com/cloudwego/kitex/pkg/remote/codec/protobuf"
+	"github.com/cloudwego/kitex/pkg/remote/codec/grpc"
 	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/metadata"
+	"github.com/cloudwego/kitex/pkg/rpcinfo"
 )
 
 type cliTransHandlerFactory struct{}
@@ -39,7 +41,7 @@ func (f *cliTransHandlerFactory) NewTransHandler(opt *remote.ClientOption) (remo
 func newCliTransHandler(opt *remote.ClientOption) (*cliTransHandler, error) {
 	return &cliTransHandler{
 		opt:   opt,
-		codec: protobuf.NewGRPCCodec(),
+		codec: grpc.NewGRPCCodec(grpc.WithThriftCodec(opt.PayloadCodec)),
 	}, nil
 }
 
@@ -50,22 +52,32 @@ type cliTransHandler struct {
 	codec remote.Codec
 }
 
-func (h *cliTransHandler) Write(ctx context.Context, conn net.Conn, msg remote.Message) (err error) {
+func (h *cliTransHandler) Write(ctx context.Context, conn net.Conn, msg remote.Message) (nctx context.Context, err error) {
 	buf := newBuffer(conn.(*clientConn))
 	defer buf.Release(err)
 
 	if err = h.codec.Encode(ctx, msg, buf); err != nil {
-		return err
+		return ctx, err
 	}
-	return buf.Flush()
+	return ctx, buf.Flush()
 }
 
-func (h *cliTransHandler) Read(ctx context.Context, conn net.Conn, msg remote.Message) (err error) {
-	buf := newBuffer(conn.(*clientConn))
+func (h *cliTransHandler) Read(ctx context.Context, conn net.Conn, msg remote.Message) (nctx context.Context, err error) {
+	buf := newBuffer(conn.(GRPCConn))
 	defer buf.Release(err)
 
+	// set recv grpc compressor at client to decode the pack from server
+	ri := msg.RPCInfo()
+	remote.SetRecvCompressor(ri, conn.(hasGetRecvCompress).GetRecvCompress())
 	err = h.codec.Decode(ctx, msg, buf)
-	return
+	if bizStatusErr, isBizErr := kerrors.FromBizStatusError(err); isBizErr {
+		if setter, ok := ri.Invocation().(rpcinfo.InvocationSetter); ok {
+			setter.SetBizStatusErr(bizStatusErr)
+			return ctx, nil
+		}
+	}
+	ctx = receiveHeaderAndTrailer(ctx, conn)
+	return ctx, err
 }
 
 func (h *cliTransHandler) OnRead(ctx context.Context, conn net.Conn) (context.Context, error) {
